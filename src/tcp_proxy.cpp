@@ -21,28 +21,41 @@ void TcpProxy::begin() {
 }
 
 void TcpProxy::loop() {
-  // Don't attempt upstream connection without station WiFi (avoids DNS errors)
-  if (!WiFi.isConnected()) return;
-  // Don't attempt upstream connection without a configured remote host
-  if (strlen(_remoteHost) == 0) return;
-
-  if (!_upstream.connected()) {
-    unsigned long now = millis();
-    if (!_disconnected) {
-      disconnectAll();
-      _disconnected = true;
-    }
-    if (now - _lastReconnect > 5000) {
-      _lastReconnect = now;
-      if (connectUpstream()) {
-        _disconnected = false;
-      }
-    }
+  if (!WiFi.isConnected() || strlen(_remoteHost) == 0) {
+    disconnectAll();
+    _upstream.stop();
+    _disconnected = true;
     return;
   }
 
-  // accept new clients
+  if (!_upstream.connected() && !_disconnected) {
+    disconnectAll();
+    _disconnected = true;
+  }
   while (acceptClient() >= 0) {}
+
+  bool hasClients = false;
+  for (uint8_t i = 0; i < _maxClients; i++) {
+    if (_clients[i].active && !_clients[i].local->connected()) disconnectClient(i);
+    if (_clients[i].active) hasClients = true;
+  }
+  // Idle camera/FTPS proxies must not occupy printer connection slots.
+  if (!hasClients) {
+    _upstream.stop();
+    _disconnected = true;
+    return;
+  }
+
+  if (!_upstream.connected()) {
+    unsigned long now = millis();
+    if (now - _lastReconnect > UPSTREAM_RETRY_MS) {
+      if (connectUpstream()) {
+        _disconnected = false;
+      }
+      _lastReconnect = millis();  // wait after the attempt, including its timeout
+    }
+    return;
+  }
 
   // forward upstream -> all downstream (broadcast)
   forwardUpToDown();
@@ -71,7 +84,11 @@ void TcpProxy::setRemote(const char *host, uint16_t port) {
 bool TcpProxy::connectUpstream() {
   if (_upstream.connected()) return true;
   _upstream.stop();
+#ifdef ESP32
+  _upstream.setTimeout(1);  // ESP32 WiFiClient uses seconds, including TCP connect
+#else
   _upstream.setTimeout(1000);
+#endif
 
   const char *host = _remoteHost;
   char resolved[64];

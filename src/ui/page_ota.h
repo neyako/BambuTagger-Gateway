@@ -165,7 +165,12 @@ static void handleUpdateFromGithub() {
 
   WiFiClientSecure client;
   client.setInsecure();
+#ifdef ESP32
+  client.setTimeout(10);  // WiFiClientSecure uses seconds; HTTPClient uses milliseconds
+  client.setHandshakeTimeout(10);
+#else
   client.setTimeout(10000);
+#endif
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);

@@ -49,6 +49,7 @@ struct GatewayConfig {
 #define MAX_MQTT_CLIENTS      8
 #define MAX_TCP_CLIENTS       6
 #define MQTT_BUFFER_SIZE      20480
+#define UPSTREAM_RETRY_MS     10000UL  // recover quickly after printer-side disconnect
 
 // MQTT topics
 #define MQTT_REPORT_TOPIC     "device/%s/report"
