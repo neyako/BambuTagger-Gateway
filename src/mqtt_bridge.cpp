@@ -100,8 +100,8 @@ MqttBridge::MqttBridge()
   snprintf(localReportTopic, sizeof(localReportTopic), MQTT_REPORT_TOPIC, PRINTER_SERIAL_DFLT);
   snprintf(localRequestTopic, sizeof(localRequestTopic), MQTT_REQUEST_TOPIC, PRINTER_SERIAL_DFLT);
 
-  _pubsub.setClient(*_upTcp);
   _pubsub.setBufferSize(MQTT_BUFFER_SIZE);
+  _pubsub.setSocketTimeout(3);  // seconds; MQTT reads share the web UI loop
   _pubsub.setCallback([this](char *t, uint8_t *p, unsigned int l) {
     onUpstreamMessage(t, p, l);
   });
@@ -166,7 +166,7 @@ void MqttBridge::begin(GatewayConfig *cfg) {
       IPAddress localIP = WiFi.isConnected() ? WiFi.localIP() : WiFi.softAPIP();
       Serial.printf("MQTT: generating cert with IP %s\n", localIP.toString().c_str());
       uint8_t ipBytes[4] = { localIP[0], localIP[1], localIP[2], localIP[3] };
-      if (!generateCertChain(_cfg->gatewaySerial, _certDer, &_certLen,
+    if (!generateCertChain(_cfg->printerSerial, _certDer, &_certLen,
                               _keyDer, &_keyLen,
                               _caDer, &_caLen,
                               ipBytes)) {
@@ -207,8 +207,7 @@ void MqttBridge::loop() {
     // Attempt upstream MQTT connection (only if printer is configured and WiFi is up)
     if (WiFi.isConnected() && _cfg && strlen(_cfg->printerHost) > 0) {
       unsigned long now = millis();
-      if (now - _lastReconnect > 5000) {
-        _lastReconnect = now;
+      if (now - _lastReconnect > UPSTREAM_RETRY_MS) {
         if (connectUpstream()) {
 #ifdef ESP32
           invalidateAesKeys(_upSslCtx);
@@ -216,35 +215,11 @@ void MqttBridge::loop() {
           char sn[64];
           strncpy(sn, _cfg->printerSerial, sizeof(sn) - 1);
           sn[sizeof(sn) - 1] = 0;
-          const char *extraTopics[] = {
-            "device/%s/report",
-            "device/%s/status",
-            "device/%s/info",
-            "device/%s/telemetry",
-            "device/%s/push",
-            "%s/report",
-            "report/%s",
-          };
-          for (auto *fmt : extraTopics) {
-            char topic[64];
-            snprintf(topic, sizeof(topic), fmt, sn);
-            _pubsub.subscribe(topic, 0);
-          }
-          for (int i = 0; i < MAX_MQTT_CLIENTS; i++) {
-            if (_clients[i].active) {
-              for (uint8_t s = 0; s < _clients[i].subCount; s++) {
-                String upTopic = _clients[i].subs[s].topic;
-                if (strcmp(_cfg->gatewaySerial, _cfg->printerSerial) != 0) {
-                  String pfx = String("device/") + _cfg->gatewaySerial;
-                  if (upTopic.startsWith(pfx))
-                    upTopic = String("device/") + _cfg->printerSerial + upTopic.substring(pfx.length());
-                }
-                _pubsub.subscribe(upTopic.c_str(),
-                                  _clients[i].subs[s].qos);
-              }
-            }
-          }
+          char topic[64];
+          snprintf(topic, sizeof(topic), "device/%s/report", sn);
+          _pubsub.subscribe(topic, 0);
         }
+        _lastReconnect = millis();  // allow a full retry delay after blocking I/O
       }
     }
   } else {
@@ -328,15 +303,29 @@ MqttStatus MqttBridge::getStatus() {
 // ------------------------------------------------------------------
 bool MqttBridge::connectUpstream() {
   if (!_cfg) return false;
-  delete _upTcp;
+  if (!_upTcp) {
 #ifdef ESP32
-  _upTcp = new UpstreamClient();
-  _upSslCtx = nullptr;
+    _upTcp = new UpstreamClient();
 #else
-  _upTcp = new WiFiClientSecure();
+    _upTcp = new WiFiClientSecure();
+#endif
+    _pubsub.setClient(*_upTcp);
+  }
+  // Keep PubSubClient's client reference valid and reset its old MQTT state
+  // before opening a new TLS session.
+  _upTcp->stop();
+  _pubsub.connected();
+#ifdef ESP32
+  _upSslCtx = nullptr;
 #endif
   _upTcp->setInsecure();
-  _upTcp->setTimeout(10000);
+  // ponytail: synchronous connects pause HTTP; use async I/O if these bounds are too slow.
+#ifdef ESP32
+  _upTcp->setTimeout(3);  // ESP32 WiFiClientSecure uses seconds, not milliseconds
+  _upTcp->setHandshakeTimeout(5);  // independent TLS deadline, in seconds
+#else
+  _upTcp->setTimeout(3000);
+#endif
 
   const char *host = _cfg->printerHost;
   char resolved[64];
@@ -357,10 +346,13 @@ bool MqttBridge::connectUpstream() {
 #endif
   if (!_upTcp->connect(host, MQTT_PRINTER_PORT)) {
 #ifdef ESP32
-    delete _upTcp; _upTcp = nullptr; _upSslCtx = nullptr;
+    char error[160] = {};
+    int code = _upTcp->lastError(error, sizeof(error));
+    Serial.printf("MQTT: TCP/TLS connection failed (%d): %s; retry in 60s\n", code, error);
 #else
-    delete _upTcp; _upTcp = nullptr;
+    Serial.println("MQTT: TCP/TLS connection failed; retry in 60s");
 #endif
+    _upTcp->stop();
     return false;
   }
 #ifdef ESP32
@@ -368,19 +360,14 @@ bool MqttBridge::connectUpstream() {
   const char *upCs = mbedtls_ssl_get_ciphersuite(_upSslCtx);
   Serial.printf("TLS: upstream cipher=%s\n", upCs ? upCs : "?");
 #endif
-  _pubsub.setClient(*_upTcp);
-
-  char willTopic[64];
-  snprintf(willTopic, sizeof(willTopic), "device/%s/status", _cfg->printerSerial);
-
   char clientId[48];
-  snprintf(clientId, sizeof(clientId), "BambuTagger-%s", _cfg->printerSerial);
+  // Identify this gateway, not the shared printer, to avoid client ID collisions.
+  snprintf(clientId, sizeof(clientId), "BambuTagger-%s", WiFi.macAddress().c_str());
 
-  bool ok = _pubsub.connect(clientId, "bblp", _cfg->printerCode,
-                            willTopic, 1, true, "offline");
-  if (ok) {
-    _pubsub.publish(willTopic, "online", true);
-  }
+  // The printer owns its availability topic. No retained status or last will.
+  bool ok = _pubsub.connect(clientId, "bblp", _cfg->printerCode);
+  Serial.printf("MQTT: upstream CONNECT result=%d (0=connected, -4=timeout, 4=credentials, 5=unauthorized)\n",
+                _pubsub.state());
   return ok;
 }
 
@@ -426,8 +413,19 @@ void MqttBridge::onUpstreamMessage(char *topic, uint8_t *payload, unsigned int l
   for (int i = 0; i < MAX_MQTT_CLIENTS; i++) {
     if (!_clients[i].active) continue;
     for (uint8_t s = 0; s < _clients[i].subCount; s++) {
-      if (topicMatchesSub(t, _clients[i].subs[s].topic)) {
-        sendPublish(*_clients[i].client, t, payload, len, 0);
+      // Clients may subscribe using either gateway or physical-printer
+      // serial. Preserve each client's requested topic in forwarded reports.
+      if (topicMatchesSub(topic, _clients[i].subs[s].topic) ||
+          topicMatchesSub(t, _clients[i].subs[s].topic)) {
+#ifdef ESP32
+        // AES hardware is shared by all TLS clients; reload this client's key
+        // after the previous client's encrypted write.
+        if (_clients[i].isTls)
+          ((TlsWiFiClient *)_clients[i].client)->clearKeyInHardware();
+#endif
+        const String &filter = _clients[i].subs[s].topic;
+        String outTopic = topicMatchesSub(topic, filter) ? String(topic) : t;
+        sendPublish(*_clients[i].client, outTopic, payload, len, 0);
         break;
       }
     }
@@ -570,6 +568,7 @@ void MqttBridge::handleClient(int idx) {
 
   switch (type) {
     case 1: { // CONNECT
+      if (remaining > 4096) { disconnectClient(idx); return; }
       // Dump CONNECT variable header + payload
       uint8_t *connBuf = new uint8_t[remaining + 1];
       size_t connPos = 0;
@@ -607,19 +606,9 @@ void MqttBridge::handleClient(int idx) {
         TlsWiFiClient *tls = (TlsWiFiClient *)&c;
         tls->flushWrites();
         delay(100);
-        // Pre-read: try to fetch any data the client sent after ConnAck.
-        // This MUST happen before handleClient returns because
-        // mbedtls_ssl_read() works here but can fail with WANT_READ
-        // on subsequent calls (after mbedtls_ssl_write() was used).
-        uint8_t preBuf[512];
-        int preR = c.read(preBuf, sizeof(preBuf));
-        if (preR > 0) {
-          tls->bufferReadData(preBuf, preR);
-        }
-        int rawA = tls->rawAvailable();
-        int decA = c.available();
-        Serial.printf("MQTT: ConnAck flush done, preRead=%d avail=%d rawAvail=%d connected=%d\n",
-                      preR, decA, rawA, c.connected());
+        // Do not probe for client data here. HA deliberately waits for CONNACK;
+        // a speculative TLS read reports WANT_READ as a disconnect in this client.
+        Serial.println("MQTT: ConnAck flushed");
       }
       break;
     }
@@ -649,8 +638,15 @@ void MqttBridge::handleClient(int idx) {
         pid = (pidBuf[0] << 8) | pidBuf[1];
       }
 
-      uint32_t payloadLen = remaining - 2 - tlen - (qos > 0 ? 2 : 0);
-      uint32_t toRead = (payloadLen > MQTT_BUFFER_SIZE) ? MQTT_BUFFER_SIZE : payloadLen;
+      uint32_t overhead = 2 + tlen + (qos > 0 ? 2 : 0);
+      if (remaining < overhead || remaining - overhead > MQTT_BUFFER_SIZE) {
+        Serial.printf("MQTT: reject invalid PUBLISH len=%lu topicLen=%u\n",
+                      (unsigned long)remaining, tlen);
+        disconnectClient(idx);
+        return;
+      }
+      uint32_t payloadLen = remaining - overhead;
+      uint32_t toRead = payloadLen;
       uint8_t *payload = new uint8_t[toRead ? toRead : 1];
       if (toRead > 0 && !readBytes(c, payload, toRead)) { delete[] payload; return; }
 
@@ -903,24 +899,19 @@ void MqttBridge::sendPublish(WiFiClient &c, const String &topic,
                              uint8_t qos) {
   uint16_t tlen = topic.length();
   uint32_t totalRemaining = 2 + tlen + len;
-  c.write((uint8_t)((3 << 4) | (qos << 1)));
-  writeRemainingLength(c, totalRemaining);
-  c.write((uint8_t)(tlen >> 8));
-  c.write((uint8_t)(tlen & 0xFF));
-  for (uint16_t i = 0; i < tlen; i++) {
-    c.write((uint8_t)topic[i]);
-  }
-  if (len > 0) {
-    constexpr size_t CHUNK = 2048;
-    const uint8_t *p = payload;
-    uint32_t rem = len;
-    while (rem > 0) {
-      size_t n = (rem > CHUNK) ? CHUNK : rem;
-      c.write(p, n);
-      p += n;
-      rem -= n;
-    }
-  }
+  uint8_t rem[4]; uint8_t rlen = 0;
+  uint32_t n = totalRemaining;
+  do { uint8_t b = n % 128; n /= 128; if (n) b |= 0x80; rem[rlen++] = b; } while (n);
+  uint32_t packetLen = 1 + rlen + totalRemaining;
+  uint8_t *packet = new uint8_t[packetLen];
+  uint32_t p = 0;
+  packet[p++] = (uint8_t)((3 << 4) | (qos << 1));
+  memcpy(packet + p, rem, rlen); p += rlen;
+  packet[p++] = (uint8_t)(tlen >> 8); packet[p++] = (uint8_t)tlen;
+  memcpy(packet + p, topic.c_str(), tlen); p += tlen;
+  if (len) memcpy(packet + p, payload, len);
+  c.write(packet, packetLen);
+  delete[] packet;
 #ifdef ESP32
   // Downstream encrypt (c.write for TLS clients) loaded the downstream AES key
   // into the shared hardware register, leaving upstream's key_in_hardware stale.

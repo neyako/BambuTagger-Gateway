@@ -114,7 +114,12 @@ static int compareVersions(const String &a, const String &b) {
 static String fetchLatestVersion() {
   WiFiClientSecure client;
   client.setInsecure();
+#ifdef ESP32
+  client.setTimeout(5);  // WiFiClientSecure uses seconds; HTTPClient uses milliseconds
+  client.setHandshakeTimeout(5);
+#else
   client.setTimeout(5000);
+#endif
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);

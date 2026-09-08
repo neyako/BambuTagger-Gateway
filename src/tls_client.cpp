@@ -180,6 +180,7 @@ int TlsWiFiClient::continueHandshake() {
                   _hsRetries, c, a, _dumpLen);
   }
 
+  clearKeyInHardware();
   int r = mbedtls_ssl_handshake(&_ssl);
   if (r == 0) {
     _hsDone = true; _hsRetries = 0;
@@ -244,104 +245,31 @@ void TlsWiFiClient::stop() {
 
 size_t TlsWiFiClient::write(uint8_t b) { return write(&b, 1); }
 
-// Manually encrypt and send a TLS Application Data record, bypassing
-// mbedtls_ssl_write().  The ESP32 mbedTLS port's ssl_decrypt_buf()
-// breaks after a write (returns WANT_READ despite valid records), so
-// we keep the read context pristine by never calling mbedtls_ssl_write().
+// Let mbedTLS own record lengths, sequence numbers, and partial writes.
 size_t TlsWiFiClient::write(const uint8_t *buf, size_t size) {
   if (!_ok || !_hsDone) return 0;
-  if (size == 0) return 0;
-
-  mbedtls_ssl_transform *t = _ssl.transform_out;
-  if (!t) { _ok = false; return 0; }
-
-  // Log transform details and both sequence number fields
-  Serial.printf("TLS: manw write size=%d ivlen=%d fixiv=%d taglen=%d expl=%d "
-                "out_ctr=%02x%02x%02x%02x%02x%02x%02x%02x "
-                "cur_out=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                (int)size, (int)t->ivlen, (int)t->fixed_ivlen, (int)t->taglen,
-                (int)(t->ivlen - t->fixed_ivlen),
-                _ssl.out_ctr[0], _ssl.out_ctr[1], _ssl.out_ctr[2], _ssl.out_ctr[3],
-                _ssl.out_ctr[4], _ssl.out_ctr[5], _ssl.out_ctr[6], _ssl.out_ctr[7],
-                _ssl.cur_out_ctr[0], _ssl.cur_out_ctr[1], _ssl.cur_out_ctr[2], _ssl.cur_out_ctr[3],
-                _ssl.cur_out_ctr[4], _ssl.cur_out_ctr[5], _ssl.cur_out_ctr[6], _ssl.cur_out_ctr[7]);
-
-  // Build nonce = fixed_iv || explicit_nonce
-  size_t expl = t->ivlen - t->fixed_ivlen;
-  // Use cur_out_ctr (the authoritative outbound record sequence number)
-  uint8_t nonce[16];
-  memcpy(nonce, t->iv_enc, t->fixed_ivlen);
-  memcpy(nonce + t->fixed_ivlen, _ssl.cur_out_ctr, expl);
-
-  // TLS record header
-  uint8_t hdr[5];
-  hdr[0] = MBEDTLS_SSL_MSG_APPLICATION_DATA;
-  hdr[1] = (uint8_t)_ssl.major_ver;
-  hdr[2] = (uint8_t)_ssl.minor_ver;
-  uint16_t rec_len = (uint16_t)(expl + size + t->taglen);
-  hdr[3] = (uint8_t)(rec_len >> 8);
-  hdr[4] = (uint8_t)(rec_len & 0xFF);
-
-  // AAD = outbound seq_num (8) || type (1) || version (2) || TLSCompressed.length (2)
-  // TLSCompressed.length is the PLAINTEXT length, NOT the total TLS record length
-  uint8_t aad[13];
-  memcpy(aad, _ssl.cur_out_ctr, 8);
-  aad[8] = hdr[0]; aad[9] = hdr[1]; aad[10] = hdr[2];
-  aad[11] = (uint8_t)(size >> 8);
-  aad[12] = (uint8_t)(size & 0xFF);
-
-  // Encrypt — output gets ciphertext || tag (olen = size + taglen)
-  uint8_t ct_buf[size + t->taglen];
-  size_t ctlen = 0;
-  int ret = mbedtls_cipher_auth_encrypt_ext(&t->cipher_ctx_enc,
-                                            nonce, t->ivlen,
-                                            aad, sizeof(aad),
-                                            buf, size,
-                                            ct_buf, sizeof(ct_buf), &ctlen,
-                                            t->taglen);
-  if (ret != 0) {
-    Serial.printf("TLS: encrypt error: -0x%x\n", -ret);
-    return 0;
-  }
-
-  // Write header + explicit_nonce + (ciphertext || tag)
-  _tcp->write(hdr, 5);
-  _tcp->write(nonce + t->fixed_ivlen, expl);
-  _tcp->write(ct_buf, ctlen);
-  _tcp->flush();
-
-  // Invalidate key_in_hardware for both transforms so the next read/write
-  // on this downstream context forces a hardware reload.
-  for (auto *t : { _ssl.transform_in, _ssl.transform_out }) {
-    if (!t) continue;
-    for (auto *ctx : { &t->cipher_ctx_dec, &t->cipher_ctx_enc }) {
-      if (!ctx->cipher_info || !ctx->cipher_ctx) continue;
-      mbedtls_cipher_type_t ct2 = ctx->cipher_info->type;
-      if (ct2 < MBEDTLS_CIPHER_AES_128_ECB || ct2 > MBEDTLS_CIPHER_AES_256_KWP)
-        continue;
-      if (ctx->cipher_info->mode == MBEDTLS_MODE_GCM ||
-          ctx->cipher_info->mode == MBEDTLS_MODE_CCM) {
-        esp_gcm_context *gcm = (esp_gcm_context *)ctx->cipher_ctx;
-        gcm->aes_ctx.key_in_hardware = 0;
-      } else {
-        esp_aes_context *aes = (esp_aes_context *)ctx->cipher_ctx;
-        aes->key_in_hardware = 0;
-      }
+  size_t total = 0;
+  unsigned long start = millis();
+  while (total < size) {
+    clearKeyInHardware();
+    int r = mbedtls_ssl_write(&_ssl, buf + total, size - total);
+    if (r > 0) {
+      total += r;
+    } else if ((r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE)
+               && millis() - start < 3000) {
+      delay(1);
+    } else {
+      Serial.printf("TLS: write failed: %d\n", r);
+      _ok = false;
+      break;
     }
   }
-
-  // Increment outbound sequence number (both copies)
-  for (int i = 7; i >= 0; i--)
-    if (++_ssl.cur_out_ctr[i] != 0) break;
-  for (int i = 7; i >= 0; i--)
-    if (++_ssl.out_ctr[i] != 0) break;
-
-  Serial.printf("TLS: manw wrote %d bytes (enc %d)\n", (int)(5 + expl + ctlen), (int)size);
-  return size;
+  return total;
 }
 
 int TlsWiFiClient::available() {
   if (!_ok || !_tcp) return 0;
+  if (_rlen > 0) return _rlen;
   int avail = mbedtls_ssl_get_bytes_avail(&_ssl);
   if (avail > 0) return avail;
   // Only fetch from TCP after handshake is done
@@ -383,6 +311,7 @@ int TlsWiFiClient::read(uint8_t *buf, size_t size) {
           (_tcp && _tcp->available() == 0)) {
         return total > 0 ? (int)total : -1;
       }
+      clearKeyInHardware();
       int r = mbedtls_ssl_read(&_ssl, buf, size);
       if (r >= 0) {
         total += r;
@@ -442,15 +371,10 @@ int TlsWiFiClient::read(uint8_t *buf, size_t size) {
 }
 
 int TlsWiFiClient::peek() { return -1; }
-void TlsWiFiClient::flush() {
-  // Flush the underlying TCP send buffer (forces lwIP tcp_output)
-  if (_tcp) _tcp->flush();
-}
-void TlsWiFiClient::flushWrites() {
-  if (!_ok || !_hsDone) return;
-  // Flush the TCP send buffer so the client receives pending TLS records
-  if (_tcp) _tcp->flush();
-}
+// TCP writes are already submitted. WiFiClient::flush() clears RECEIVED
+// bytes on this SDK; calling it here loses TLS records and their sequence.
+void TlsWiFiClient::flush() {}
+void TlsWiFiClient::flushWrites() {}
 void TlsWiFiClient::clearKeyInHardware() {
   for (auto *t : { _ssl.transform_in, _ssl.transform_out }) {
     if (!t) continue;
@@ -472,7 +396,6 @@ void TlsWiFiClient::clearKeyInHardware() {
 }
 
 uint8_t TlsWiFiClient::connected() {
-  if (!_ok && _tcp) return _tcp->connected();
   return _ok && _tcp && _tcp->connected();
 }
 
@@ -533,13 +456,14 @@ int TlsWiFiClient::bio_send(void *ctx, const unsigned char *buf, size_t len) {
   // mbedtls_ssl_read() to return WANT_READ (because it tries to flush
   // output first).
   size_t total = 0;
+  unsigned long start = millis();
   while (total < len) {
     int r = c->_tcp->write(buf + total, len - total);
     if (r > 0) {
       total += (size_t)r;
     } else {
       if (!c->_tcp->connected()) return MBEDTLS_ERR_SSL_CONN_EOF;
-      // TCP send buffer full — yield and retry
+      if (millis() - start > 3000) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
       delay(1);
     }
   }

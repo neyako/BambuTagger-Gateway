@@ -41,7 +41,7 @@ static const char _PAGE_ROOT2[] PROGMEM = R"html(
   <div style="margin:12px 0">
     <div class="info-row"><span class="lbl">IP</span><span class="val">%%STA_IP%%</span></div>
     <div class="info-row"><span class="lbl">Gateway Name</span><span class="val">%%PRINTER_NAME%%</span></div>
-    <div class="info-row"><span class="lbl">Serial</span><span class="val">%%GATEWAY_SERIAL%%</span></div>
+    <div class="info-row"><span class="lbl">Printer Serial</span><span class="val">%%PRINTER_SERIAL%%</span></div>
     <div class="info-row"><span class="lbl">Model</span><span class="val">%%PRINTER_MODEL%%</span></div>
     <div class="info-row"><span class="lbl">Access Code</span><span class="val">%%PRINTER_CODE%%</span></div>
   </div>
@@ -76,7 +76,7 @@ static String buildRoot() {
   }
 
   page.replace("%%PRINTER_HOST%%", _cfg.printerHost);
-  page.replace("%%GATEWAY_SERIAL%%", _cfg.gatewaySerial);
+  page.replace("%%PRINTER_SERIAL%%", _cfg.printerSerial);
   page.replace("%%PRINTER_MODEL%%", _cfg.printerModel);
   page.replace("%%PRINTER_CODE%%", _cfg.printerCode);
   page.replace("%%PRINTER_NAME%%", _displayName);
