@@ -9,7 +9,7 @@
 // CI tag builds pass -DVERSION="<tag>" so the update check compares against
 // what is actually installed.
 #ifndef VERSION
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 #endif
 
 // ── Runtime config (stored in EEPROM) ─────────────────────────────────
