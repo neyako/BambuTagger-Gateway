@@ -514,26 +514,9 @@ int MqttBridge::acceptClient() {
                     raw.remoteIP().toString().c_str(), raw.remotePort(),
                     raw.localIP().toString().c_str(), raw.localPort());
 
-      // Wait for first byte — need to delay slightly to let Bambu Studio
-      // send the TLS ClientHello before we try to do TLS handshake.
-      int peeked = -1;
-      for (int w = 0; w < 20; w++) {
-        if (!raw.connected()) { raw.stop(); return -1; }
-        if (raw.available() > 0) {
-          peeked = raw.read();
-          break;
-        }
-        delay(5);
-      }
-
-      if (peeked < 0) {
-        Serial.printf("MQTT: probe from %s:%d (closing)\n",
-                      raw.remoteIP().toString().c_str(), raw.remotePort());
-        raw.stop();
-        return -1;
-      }
-
-      // Client sent data — restore the byte and do TLS
+      // Don't wait for the ClientHello here: the handshake is non-blocking (30 s
+      // limit) and silent sockets are reaped by the CONNECT keepalive. The old
+      // 100 ms wait dropped real clients whenever WiFi latency spiked past it.
       IPAddress ip = raw.remoteIP();
       WiFiClient *rawTcp = new WiFiClient(raw);
       TlsWiFiClient *tls = new TlsWiFiClient();
@@ -542,9 +525,6 @@ int MqttBridge::acceptClient() {
         delete tls;
         return -1;
       }
-
-      // Feed the peeked byte back through the TLS client
-      tls->feedData((uint8_t)peeked);
 
       for (int i = 0; i < MAX_MQTT_CLIENTS; i++) {
         if (!_clients[i].active) {

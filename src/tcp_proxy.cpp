@@ -70,10 +70,11 @@ void TcpProxy::loop() {
     // Relay half-closes like TCP: once a side has sent everything (EOF), pass
     // its FIN on and keep the other direction open until that ends too. A
     // dead socket (failed write) ends the pair; so does a peer that vanished
-    // without RST, after HALF_CLOSE_IDLE_MS with nothing moving.
+    // without RST, after HALF_CLOSE_IDLE_MS with nothing moving. The grace
+    // period starts at the FIN, not at the last byte of an idle connection.
     bool localEof = !peerOpen(p.local), upEof = !peerOpen(p.up);
-    if (localEof && !p.upShut) { shutWrite(p.up); p.upShut = true; }
-    if (upEof && !p.localShut) { shutWrite(p.local); p.localShut = true; }
+    if (localEof && !p.upShut) { shutWrite(p.up); p.upShut = true; p.lastData = millis(); }
+    if (upEof && !p.localShut) { shutWrite(p.local); p.localShut = true; p.lastData = millis(); }
     bool stale = (localEof || upEof) && millis() - p.lastData > HALF_CLOSE_IDLE_MS;
     if (!ready || !p.local.connected() || !p.up.connected() || (localEof && upEof) || stale) {
       p.local.stop();

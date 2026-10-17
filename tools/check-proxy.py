@@ -171,6 +171,17 @@ int main() {
   *upKFin = true; proxy.loop();
   assert(k.tx->size() == 1024 && *k.shut && !k.connected() && !*upK); // whole reply, then closed
 
+  // Long-idle session (e.g. FTPS control between commands), then a half-close:
+  // the grace period starts at the FIN, so a reply 100 ms later still arrives.
+  auto q = arrive();
+  proxy.loop();
+  auto upQ = remote; auto upQRx = remoteRx; auto upQFin = remoteFin;
+  clockMs += 60000; proxy.loop();
+  *q.fin = true; proxy.loop();
+  assert(q.connected());
+  clockMs += 100; *upQRx = "226 Done"; *upQFin = true; proxy.loop();
+  assert(*q.tx == "226 Done" && !q.connected() && !*upQ);
+
   // Client vanished without RST while the printer side sits idle.
   auto m = arrive();
   proxy.loop();
@@ -199,4 +210,4 @@ with tempfile.TemporaryDirectory() as directory:
         "-o", str(temp / "check"),
     ], check=True)
     subprocess.run([str(temp / "check")], check=True)
-print("PASS: fdOpen on real sockets, idle, per-client upstream, relay, refusal, full, socket reserve, clean close, half-close across a gap, vanished peer, FTPS reserve, Wi-Fi loss")
+print("PASS: fdOpen on real sockets, idle, per-client upstream, relay, refusal, full, socket reserve, clean close, half-close across a gap, FIN after a long idle, vanished peer, FTPS reserve, Wi-Fi loss")
