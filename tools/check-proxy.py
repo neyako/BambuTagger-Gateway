@@ -52,6 +52,7 @@ struct WiFiClient {
 inline std::deque<WiFiClient> pending;
 inline int mockFree = 8;
 inline int freeSockets() { return mockFree; }
+inline int socketReserve() { return 2; }  // printer link down
 inline bool peerOpen(WiFiClient &c) { return c.connected() && (c.available() || !*c.fin); }
 struct WiFiServer {
   WiFiServer(uint16_t) {}
@@ -65,11 +66,24 @@ struct WiFiServer {
 """
 check = r"""
 #include <cassert>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "tcp_proxy.h"
 WiFiClient arrive() {
   WiFiClient c; *c.live = true; pending.push_back(c); return c;
 }
 int main() {
+  // The real FIN detector, on real sockets.
+  int sv[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  assert(fdOpen(sv[0]));  // open, nothing pending
+  assert(write(sv[1], "x", 1) == 1 && shutdown(sv[1], SHUT_WR) == 0);
+  assert(fdOpen(sv[0]));  // FIN behind unread data: still open
+  char ch;
+  assert(read(sv[0], &ch, 1) == 1);
+  assert(!fdOpen(sv[0]));  // orderly close detected
+  close(sv[0]); close(sv[1]);
+
   TcpProxy proxy("camera", 6000, "printer", 6000, 2);
   proxy.begin();
   proxy.loop();
@@ -109,6 +123,15 @@ int main() {
   auto g = arrive();
   proxy.loop();
   assert(attempts == 4 && !g.connected()); // Socket reserve kept for printer MQTT + web UI.
+  TcpProxy ftps("ftps", 990, "printer", 990, 2, true);
+  auto u = arrive();
+  ftps.loop();
+  assert(attempts == 5 && u.connected()); // A short-lived FTPS upload may use the reserve...
+  u.stop(); ftps.loop();
+  mockFree = 0;
+  auto u2 = arrive();
+  ftps.loop();
+  assert(attempts == 5 && !u2.connected()); // ...but never the last socket.
   mockFree = 8;
 
   // FTPS after QUIT: printer and client both close cleanly, nothing is written.
@@ -121,12 +144,20 @@ int main() {
   proxy.loop();
   assert(!h.connected() && !*upH); // ...then both sockets are released.
 
+  // Client half-closes while 1 KiB of reply is still queued at the printer.
+  auto k = arrive();
+  proxy.loop();
+  auto upK = remote; auto upKRx = remoteRx;
+  *upKRx = std::string(1024, 'r'); *k.fin = true;
+  for (int i = 0; i < 4; i++) proxy.loop();
+  assert(k.tx->size() == 1024 && !k.connected() && !*upK); // whole tail, then closed
+
   WiFi.up = false;
   proxy.loop();
   assert(!b.connected() && !*remote); // Wi-Fi loss releases both sides.
   auto f = arrive();
   proxy.loop();
-  assert(attempts == 5 && !f.connected()); // No printer dial without Wi-Fi.
+  assert(attempts == 7 && !f.connected()); // No printer dial without Wi-Fi.
 }
 """
 with tempfile.TemporaryDirectory() as directory:
@@ -139,4 +170,4 @@ with tempfile.TemporaryDirectory() as directory:
         "-o", str(temp / "check"),
     ], check=True)
     subprocess.run([str(temp / "check")], check=True)
-print("PASS: idle, per-client upstream, relay, refusal, full, socket reserve, clean close, Wi-Fi loss")
+print("PASS: fdOpen on real sockets, idle, per-client upstream, relay, refusal, full, socket reserve, clean close, half-close tail, Wi-Fi loss")

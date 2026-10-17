@@ -53,7 +53,9 @@ struct GatewayConfig {
 // Limits
 #define MAX_MQTT_CLIENTS      8
 #define MAX_TCP_CLIENTS       6
-#define SOCKET_RESERVE        2        // kept free: printer MQTT reconnect + web UI
+#define SOCKET_RESERVE        2        // kept free while the printer link is down: its reconnect + web UI
+#define MQTT_PACKET_MS        2000UL   // whole local packet must arrive within this
+#define LOOP_WDT_S            30       // loop() watchdog
 #define MQTT_BUFFER_SIZE      20480
 #define CONNECT_WAIT_S        20       // keepalive before CONNECT arrives (1.5x = 30 s)
 #define UPSTREAM_RETRY_MS     10000UL  // recover quickly after printer-side disconnect

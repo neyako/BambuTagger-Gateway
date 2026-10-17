@@ -87,17 +87,21 @@ static void handleSave() {
       "&rdquo; is not a valid IP address or hostname.");
     return;
   }
-  // Doubles as the setup AP's WPA2 passphrase, which needs 8-63 characters.
+  String ssid = _server.arg("sta_ssid");
+  if (ssid.length() >= sizeof(_cfg.stationSsid)) {  // bytes: a UTF-8 SSID can pass maxlength
+    sendSaveError("SSID Too Long", "WiFi network names are at most 32 bytes.");
+    return;
+  }
+  // Doubles as the setup AP's WPA2 passphrase (8-63 chars); never truncate it.
   String admin = _server.arg("admin_pass");
-  if (admin.length() && admin.length() < 8) {
-    sendSaveError("Password Too Short", "The admin password needs at least 8 characters.");
+  if (admin.length() && (admin.length() < 8 || admin.length() >= sizeof(_cfg.adminPass))) {
+    sendSaveError("Bad Password Length", "The admin password needs 8 to 63 characters.");
     return;
   }
   if (_server.hasArg("admin_clear")) _cfg.adminPass[0] = 0;
   else if (admin.length()) strlcpy(_cfg.adminPass, admin.c_str(), sizeof(_cfg.adminPass));
 
   // Blank secret fields keep the saved value; the page never sends them out.
-  String ssid = _server.arg("sta_ssid");
   String pass = _server.arg("sta_pass");
   if (pass.length() || ssid != _cfg.stationSsid)  // new network: blank means open
     strlcpy(_cfg.stationPass, pass.c_str(), sizeof(_cfg.stationPass));

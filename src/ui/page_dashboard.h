@@ -48,7 +48,7 @@ section+section{margin-top:28px}
   <h2>Settings</h2>
   <form method="post" action="/save">
     <label>WiFi SSID</label>
-    <input name="sta_ssid" value="%%STA_SSID%%" placeholder="Empty = setup AP only" maxlength="31">
+    <input name="sta_ssid" value="%%STA_SSID%%" placeholder="Empty = setup AP only" maxlength="32">
     <label>WiFi password</label>
     <input name="sta_pass" type="password" placeholder="%%PASS_HINT%%" maxlength="63" autocomplete="new-password">
     <label>Printer IP / hostname</label>

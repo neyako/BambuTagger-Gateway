@@ -1,14 +1,22 @@
 #include "tcp_proxy.h"
+#include <errno.h>
 #ifdef ESP32
 #include <ESPmDNS.h>
 #include <lwip/sockets.h>
+#else
+#include <sys/socket.h>
+#endif
 
-bool peerOpen(WiFiClient &c) {
-  if (!c.connected()) return false;
-  if (c.available() > 0) return true;
+// An orderly close (FIN) shows up only as recv() == 0.
+bool fdOpen(int fd) {
   uint8_t b;
-  int r = recv(c.fd(), &b, 1, MSG_PEEK | MSG_DONTWAIT);
+  int r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
   return r > 0 || (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN));
+}
+
+#ifdef ESP32
+bool peerOpen(WiFiClient &c) {
+  return c.connected() && (c.available() > 0 || fdOpen(c.fd()));
 }
 
 int freeSockets() {
@@ -20,9 +28,9 @@ int freeSockets() {
 #endif
 
 TcpProxy::TcpProxy(const char *name, uint16_t localPort, const char *remoteHost,
-                   uint16_t remotePort, uint8_t maxClients)
+                   uint16_t remotePort, uint8_t maxClients, bool shortLived)
   : _name(name), _remotePort(remotePort), _remoteHost(remoteHost),
-    _maxClients(maxClients), _server(localPort) {
+    _maxClients(maxClients), _shortLived(shortLived), _server(localPort) {
   _clients = new ProxyClient[maxClients];
 }
 
@@ -42,7 +50,8 @@ void TcpProxy::loop() {
     for (uint8_t i = 0; i < _maxClients && !slot; i++)
       if (!_clients[i].local.connected() && !_clients[i].up.connected()) slot = &_clients[i];
     // The upstream needs one more socket on top of the reserve.
-    if (slot && ready && freeSockets() > SOCKET_RESERVE && connectUpstream(slot->up)) {
+    int reserve = _shortLived ? 0 : socketReserve();
+    if (slot && ready && freeSockets() > reserve && connectUpstream(slot->up)) {
       c.setNoDelay(true);
       slot->local = c;
     } else {
@@ -55,7 +64,11 @@ void TcpProxy::loop() {
     if (!p.local.connected() && !p.up.connected()) continue;
     pump(p.up, p.local);
     pump(p.local, p.up);
-    if (!ready || !peerOpen(p.local) || !peerOpen(p.up)) {
+    // A side that hung up may only have half-closed, so it still gets the
+    // other side's pending bytes; a dead socket (failed write) ends the pair.
+    bool localEof = !peerOpen(p.local), upEof = !peerOpen(p.up);
+    if (!ready || !p.local.connected() || !p.up.connected() ||
+        (localEof && !p.up.available()) || (upEof && !p.local.available())) {
       p.local.stop();
       p.up.stop();
     }

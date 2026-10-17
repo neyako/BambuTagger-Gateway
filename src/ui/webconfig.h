@@ -139,7 +139,15 @@ static int compareVersions(const String &a, const String &b) {
   return 0;
 }
 
+// GitHub calls chain blocking timeouts (DNS, TCP, TLS, headers, a redirect)
+// that together can outlast the loop watchdog; widen it while one runs.
+struct SlowCall {
+  SlowCall() { esp_task_wdt_init(120, true); }
+  ~SlowCall() { esp_task_wdt_init(LOOP_WDT_S, true); }
+};
+
 static String fetchLatestVersion() {
+  SlowCall slow;
   WiFiClientSecure client;
   client.setCACert(GITHUB_CA);
 #ifdef ESP32

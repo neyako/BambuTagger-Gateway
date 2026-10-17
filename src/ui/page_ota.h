@@ -65,6 +65,7 @@ static void handleUpdateFromGithub() {
 
   delay(100);
 
+  SlowCall slow;  // worst case before the first feed: 2 x (10 s TCP + 10 s TLS + 15 s headers)
   WiFiClientSecure client;
   client.setCACert(GITHUB_CA);
 #ifdef ESP32
@@ -76,7 +77,7 @@ static void handleUpdateFromGithub() {
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(30000);
+  http.setTimeout(15000);
   http.setUserAgent(F("BambuTagger-Gateway"));
 
   // Must match the asset name published by .github/workflows/release.yml.

@@ -56,6 +56,7 @@ static void invalidateAesKeys(mbedtls_ssl_context *ssl) {
 }
 #endif
 
+static unsigned long pktStart;  // when the current local packet's header arrived
 static char reportTopic[64];
 static char requestTopic[64];
 static char localReportTopic[64];
@@ -507,7 +508,7 @@ int MqttBridge::acceptClient() {
     WiFiClient raw = _tlsServer.accept();
     if (raw) {
       if (!raw.connected()) { raw.stop(); return -1; }
-      if (freeSockets() < SOCKET_RESERVE) { raw.stop(); return -3; }
+      if (freeSockets() < socketReserve()) { raw.stop(); return -3; }
       raw.setNoDelay(true);
       Serial.printf("MQTT: accept from %s:%d -> %s:%d\n",
                     raw.remoteIP().toString().c_str(), raw.remotePort(),
@@ -569,7 +570,7 @@ int MqttBridge::acceptClient() {
   {
     WiFiClient plain = _localServer.accept();
     if (!plain) return -1;
-    if (freeSockets() < SOCKET_RESERVE) { plain.stop(); return -3; }
+    if (freeSockets() < socketReserve()) { plain.stop(); return -3; }
 
     WiFiClient *c = new WiFiClient(plain);
     if (!c || !c->connected()) {
@@ -627,7 +628,7 @@ void MqttBridge::handleClient(int idx) {
   int headerRead = c.read();
   if (headerRead < 0) { return; }
   header = (uint8_t)headerRead;
-  cl.lastActivity = millis();
+  cl.lastActivity = pktStart = millis();
 
   // Log first MQTT packet type from each client
   static bool logged[8] = {};
@@ -996,15 +997,15 @@ bool MqttBridge::readRemainingLength(WiFiClient &c, uint32_t &len) {
 
 // A packet split across TCP segments is normal; wait for the rest. If it never
 // comes, close the socket (loop() reaps it) rather than parse mid-packet bytes
-// as a new header.
+// as a new header. The budget is per packet: topics are read byte by byte, so
+// a per-call timeout would let a slow client hold loop() past the watchdog.
 bool MqttBridge::readBytes(WiFiClient &c, uint8_t *buf, uint32_t len) {
-  unsigned long start = millis();
   while (len > 0) {
     int got = c.read(buf, len);
     if (got > 0) {
       buf += got;
       len -= got;
-    } else if (!c.connected() || millis() - start > 1000) {
+    } else if (!c.connected() || millis() - pktStart > MQTT_PACKET_MS) {
       c.stop();
       return false;
     } else {
