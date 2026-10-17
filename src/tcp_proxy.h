@@ -19,18 +19,21 @@ int socketReserve();  // main.cpp: 1 (web UI) while the printer link holds its o
 // as open so a final packet is still delivered.
 bool peerOpen(WiFiClient &c);
 bool fdOpen(int fd);  // the raw-socket part of peerOpen()
+void shutWrite(WiFiClient &c);  // send FIN, keep receiving (half-close)
 
 // Camera (6000) and FTPS (990) are end-to-end TLS, so each local client gets
 // its own printer socket; TLS sessions cannot share one upstream stream.
 struct ProxyClient {
   WiFiClient local;
   WiFiClient up;
+  bool localShut = false, upShut = false;  // FIN already passed on to that side
+  unsigned long lastData = 0;              // last byte relayed either way
 };
 
 class TcpProxy {
 public:
-  // shortLived: sessions end on their own (FTPS uploads), so they may use the
-  // socket reserve; it only has to stop long-lived clients starving the printer.
+  // shortLived: sessions end on their own (FTPS uploads), so they may borrow
+  // the web UI's reserved socket, but never the printer reconnect's.
   TcpProxy(const char *name, uint16_t localPort, const char *remoteHost,
            uint16_t remotePort, uint8_t maxClients, bool shortLived = false);
   void begin();
@@ -48,5 +51,5 @@ private:
   ProxyClient *_clients;
 
   bool connectUpstream(WiFiClient &up);
-  static void pump(WiFiClient &from, WiFiClient &to);
+  static bool pump(WiFiClient &from, WiFiClient &to);
 };

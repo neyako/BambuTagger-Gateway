@@ -17,11 +17,13 @@ stub = r"""
 #include <memory>
 #include <deque>
 #include <string>
+inline unsigned long clockMs = 0;
+inline unsigned long millis() { return clockMs; }
 inline int attempts = 0;
 inline bool connectOK = true;
 inline std::shared_ptr<bool> remote;
 inline std::shared_ptr<std::string> remoteRx, remoteTx;
-inline std::shared_ptr<bool> remoteFin;
+inline std::shared_ptr<bool> remoteFin, remoteShut;
 struct { template <class... A> void printf(const char*, A...) {} } Serial;
 struct MockWiFi { bool up = true; bool isConnected() { return up; } };
 inline MockWiFi WiFi;
@@ -30,6 +32,7 @@ struct WiFiClient {
   std::shared_ptr<std::string> rx = std::make_shared<std::string>();
   std::shared_ptr<std::string> tx = std::make_shared<std::string>();
   std::shared_ptr<bool> fin = std::make_shared<bool>(false);  // peer closed cleanly
+  std::shared_ptr<bool> shut = std::make_shared<bool>(false); // we sent FIN
   bool connected() { return *live; }  // like the real core: blind to FIN
   explicit operator bool() { return *live; }
   void stop() { *live = false; }
@@ -39,8 +42,8 @@ struct WiFiClient {
     attempts++;
     live = std::make_shared<bool>(connectOK);
     rx = std::make_shared<std::string>(); tx = std::make_shared<std::string>();
-    fin = std::make_shared<bool>(false);
-    remote = live; remoteRx = rx; remoteTx = tx; remoteFin = fin;
+    fin = std::make_shared<bool>(false); shut = std::make_shared<bool>(false);
+    remote = live; remoteRx = rx; remoteTx = tx; remoteFin = fin; remoteShut = shut;
     return *live;
   }
   int available() { return rx->size(); }
@@ -52,7 +55,9 @@ struct WiFiClient {
 inline std::deque<WiFiClient> pending;
 inline int mockFree = 8;
 inline int freeSockets() { return mockFree; }
-inline int socketReserve() { return 2; }  // printer link down
+inline int mockReserve = 2;  // 2 = printer link down, 1 = up
+inline int socketReserve() { return mockReserve; }
+inline void shutWrite(WiFiClient &c) { *c.shut = true; }
 inline bool peerOpen(WiFiClient &c) { return c.connected() && (c.available() || !*c.fin); }
 struct WiFiServer {
   WiFiServer(uint16_t) {}
@@ -131,8 +136,17 @@ int main() {
   mockFree = 0;
   auto u2 = arrive();
   ftps.loop();
-  assert(attempts == 5 && !u2.connected()); // ...but never the last socket.
-  mockFree = 8;
+  assert(attempts == 5 && !u2.connected()); // ...but never the last socket,
+  mockFree = 1;
+  auto u3 = arrive();
+  ftps.loop();
+  assert(attempts == 5 && !u3.connected()); // ...nor the printer reconnect's while the link is down.
+  mockReserve = 1;
+  auto u4 = arrive();
+  ftps.loop();
+  assert(attempts == 6 && u4.connected()); // Link up: its own socket covers the reconnect.
+  u4.stop(); ftps.loop();
+  mockReserve = 2; mockFree = 8;
 
   // FTPS after QUIT: printer and client both close cleanly, nothing is written.
   auto h = arrive();
@@ -144,20 +158,35 @@ int main() {
   proxy.loop();
   assert(!h.connected() && !*upH); // ...then both sockets are released.
 
-  // Client half-closes while 1 KiB of reply is still queued at the printer.
+  // Client half-closes; the printer's reply arrives in two parts with a gap.
   auto k = arrive();
   proxy.loop();
-  auto upK = remote; auto upKRx = remoteRx;
-  *upKRx = std::string(1024, 'r'); *k.fin = true;
-  for (int i = 0; i < 4; i++) proxy.loop();
-  assert(k.tx->size() == 1024 && !k.connected() && !*upK); // whole tail, then closed
+  auto upK = remote; auto upKRx = remoteRx; auto upKFin = remoteFin; auto upKShut = remoteShut;
+  *upKRx = std::string(512, 'r'); *k.fin = true;
+  proxy.loop();
+  assert(*upKShut && k.tx->size() == 512 && k.connected()); // FIN passed on, pair kept
+  clockMs += 5000; proxy.loop();
+  assert(k.connected() && *upK); // a gap in the reply doesn't end it
+  *upKRx = std::string(512, 'r'); proxy.loop();
+  *upKFin = true; proxy.loop();
+  assert(k.tx->size() == 1024 && *k.shut && !k.connected() && !*upK); // whole reply, then closed
+
+  // Client vanished without RST while the printer side sits idle.
+  auto m = arrive();
+  proxy.loop();
+  auto upM = remote;
+  *m.fin = true; proxy.loop();
+  assert(m.connected());
+  clockMs += HALF_CLOSE_IDLE_MS + 1; proxy.loop();
+  assert(!m.connected() && !*upM); // reclaimed after the idle timeout
 
   WiFi.up = false;
   proxy.loop();
   assert(!b.connected() && !*remote); // Wi-Fi loss releases both sides.
+  int dials = attempts;
   auto f = arrive();
   proxy.loop();
-  assert(attempts == 7 && !f.connected()); // No printer dial without Wi-Fi.
+  assert(attempts == dials && !f.connected()); // No printer dial without Wi-Fi.
 }
 """
 with tempfile.TemporaryDirectory() as directory:
@@ -170,4 +199,4 @@ with tempfile.TemporaryDirectory() as directory:
         "-o", str(temp / "check"),
     ], check=True)
     subprocess.run([str(temp / "check")], check=True)
-print("PASS: fdOpen on real sockets, idle, per-client upstream, relay, refusal, full, socket reserve, clean close, half-close tail, Wi-Fi loss")
+print("PASS: fdOpen on real sockets, idle, per-client upstream, relay, refusal, full, socket reserve, clean close, half-close across a gap, vanished peer, FTPS reserve, Wi-Fi loss")

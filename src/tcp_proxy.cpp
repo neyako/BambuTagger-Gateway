@@ -15,6 +15,8 @@ bool fdOpen(int fd) {
 }
 
 #ifdef ESP32
+void shutWrite(WiFiClient &c) { shutdown(c.fd(), SHUT_WR); }
+
 bool peerOpen(WiFiClient &c) {
   return c.connected() && (c.available() > 0 || fdOpen(c.fd()));
 }
@@ -50,10 +52,12 @@ void TcpProxy::loop() {
     for (uint8_t i = 0; i < _maxClients && !slot; i++)
       if (!_clients[i].local.connected() && !_clients[i].up.connected()) slot = &_clients[i];
     // The upstream needs one more socket on top of the reserve.
-    int reserve = _shortLived ? 0 : socketReserve();
+    int reserve = _shortLived ? socketReserve() - 1 : socketReserve();
     if (slot && ready && freeSockets() > reserve && connectUpstream(slot->up)) {
       c.setNoDelay(true);
       slot->local = c;
+      slot->localShut = slot->upShut = false;
+      slot->lastData = millis();
     } else {
       c.stop();
     }
@@ -62,13 +66,16 @@ void TcpProxy::loop() {
   for (uint8_t i = 0; i < _maxClients; i++) {
     ProxyClient &p = _clients[i];
     if (!p.local.connected() && !p.up.connected()) continue;
-    pump(p.up, p.local);
-    pump(p.local, p.up);
-    // A side that hung up may only have half-closed, so it still gets the
-    // other side's pending bytes; a dead socket (failed write) ends the pair.
+    if (pump(p.up, p.local) | pump(p.local, p.up)) p.lastData = millis();
+    // Relay half-closes like TCP: once a side has sent everything (EOF), pass
+    // its FIN on and keep the other direction open until that ends too. A
+    // dead socket (failed write) ends the pair; so does a peer that vanished
+    // without RST, after HALF_CLOSE_IDLE_MS with nothing moving.
     bool localEof = !peerOpen(p.local), upEof = !peerOpen(p.up);
-    if (!ready || !p.local.connected() || !p.up.connected() ||
-        (localEof && !p.up.available()) || (upEof && !p.local.available())) {
+    if (localEof && !p.upShut) { shutWrite(p.up); p.upShut = true; }
+    if (upEof && !p.localShut) { shutWrite(p.local); p.localShut = true; }
+    bool stale = (localEof || upEof) && millis() - p.lastData > HALF_CLOSE_IDLE_MS;
+    if (!ready || !p.local.connected() || !p.up.connected() || (localEof && upEof) || stale) {
       p.local.stop();
       p.up.stop();
     }
@@ -119,9 +126,11 @@ bool TcpProxy::connectUpstream(WiFiClient &up) {
   return true;
 }
 
-void TcpProxy::pump(WiFiClient &from, WiFiClient &to) {
-  if (!from.available()) return;
+bool TcpProxy::pump(WiFiClient &from, WiFiClient &to) {
+  if (!from.available()) return false;
   uint8_t buf[512];
   int len = from.read(buf, sizeof(buf));
-  if (len > 0) to.write(buf, len);
+  if (len <= 0) return false;
+  to.write(buf, len);
+  return true;
 }

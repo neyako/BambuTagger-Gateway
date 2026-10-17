@@ -55,6 +55,7 @@ struct GatewayConfig {
 #define MAX_TCP_CLIENTS       6
 #define SOCKET_RESERVE        2        // kept free while the printer link is down: its reconnect + web UI
 #define MQTT_PACKET_MS        2000UL   // whole local packet must arrive within this
+#define HALF_CLOSE_IDLE_MS    10000UL  // relay pair with one side done and no traffic: close
 #define LOOP_WDT_S            30       // loop() watchdog
 #define MQTT_BUFFER_SIZE      20480
 #define CONNECT_WAIT_S        20       // keepalive before CONNECT arrives (1.5x = 30 s)
