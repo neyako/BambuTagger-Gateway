@@ -12,6 +12,8 @@ extern MqttBridge mqtt;
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <esp_task_wdt.h>
+#include <esp_core_dump.h>
 #else
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -20,14 +22,20 @@ extern MqttBridge mqtt;
 using WebServer = ESP8266WebServer;
 #endif
 #include "mqtt_bridge.h"
+#include "tcp_proxy.h"  // freeSockets()
 #include "logo_png.h"
+#include "github_ca.h"
 
 
 #define EEPROM_SIZE 512
-#define EEPROM_MAGIC 0x45
+#define EEPROM_MAGIC 0x46
+#define EEPROM_MAGIC_V1 0x45  // 1.0.0 layout, migrated on load
+static_assert(sizeof(GatewayConfig) <= EEPROM_SIZE, "config outgrew EEPROM");
 
 extern MqttBridge mqtt;
 extern char _displayName[];
+class TcpProxy;
+extern TcpProxy camProxy, ftpsProxy;
 
 static GatewayConfig _cfg;
 static WebServer _server(80);
@@ -42,10 +50,7 @@ header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px}
 header .logo{display:flex;align-items:center;gap:10px}
 header .logo img{width:28px;height:28px;flex-shrink:0;border-radius:4px}
 header h1{font-size:18px;color:#58a6ff}
-nav{background:#161b22;border-bottom:1px solid #30363d;display:flex;gap:0}
-nav a{padding:10px 20px;color:#8b949e;text-decoration:none;font-size:14px;border-bottom:2px solid transparent;transition:all .2s}
-nav a:hover{color:#c9d1d9}
-nav a.active{color:#58a6ff;border-bottom-color:#58a6ff}
+[hidden]{display:none!important}
 .wrapper{display:flex;align-items:center;justify-content:center;padding:16px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:28px;width:100%;max-width:480px}
 h2{color:#58a6ff;font-size:.9em;letter-spacing:.05em;text-transform:uppercase;margin:0 0 16px;padding-bottom:4px;border-bottom:1px solid #30363d}
@@ -55,6 +60,7 @@ select{display:block;width:100%;padding:10px 12px;margin-bottom:10px;background:
 input:focus{border-color:#58a6ff}
 button{display:block;width:100%;padding:13px;margin-top:6px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:1.05em;font-weight:bold;cursor:pointer;transition:background .2s}
 button:hover{background:#2ea043}
+button:disabled{background:#484f58;cursor:not-allowed}
 .hint{color:#484f58;font-size:.78em;margin-top:-7px;margin-bottom:10px}
 footer{position:fixed;bottom:0;left:0;right:0;text-align:center;padding:6px;font-size:10px;color:#484f58;background:#0d1117;border-top:1px solid #30363d}
 footer a{color:#484f58;text-decoration:none}
@@ -63,9 +69,31 @@ footer a:hover{color:#c9d1d9}
 
 // ── EEPROM helpers ─────────────────────────────────────────────────────
 
+// 1.0.0 layout: SSID one byte short, no admin password.
+#pragma pack(push, 1)
+struct GatewayConfigV1 {
+  uint8_t magic;
+  char stationSsid[32], stationPass[64], printerHost[64], printerCode[32],
+       printerSerial[32], gatewaySerial[32], printerModel[24];
+};
+#pragma pack(pop)
+
 static void configLoad() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, _cfg);
+  if (_cfg.magic == EEPROM_MAGIC_V1) {
+    GatewayConfigV1 v1;
+    EEPROM.get(0, v1);
+    memset(&_cfg, 0, sizeof(_cfg));
+    _cfg.magic = EEPROM_MAGIC;
+    memcpy(_cfg.stationSsid, v1.stationSsid, sizeof(v1.stationSsid));
+    memcpy(_cfg.stationPass, v1.stationPass, sizeof(v1.stationPass));
+    memcpy(_cfg.printerHost, v1.printerHost, sizeof(v1.printerHost));
+    memcpy(_cfg.printerCode, v1.printerCode, sizeof(v1.printerCode));
+    memcpy(_cfg.printerSerial, v1.printerSerial, sizeof(v1.printerSerial));
+    memcpy(_cfg.gatewaySerial, v1.gatewaySerial, sizeof(v1.gatewaySerial));
+    memcpy(_cfg.printerModel, v1.printerModel, sizeof(v1.printerModel));
+  }
   if (_cfg.magic != EEPROM_MAGIC) {
     memset(&_cfg, 0, sizeof(_cfg));
     _cfg.magic = EEPROM_MAGIC;
@@ -111,9 +139,17 @@ static int compareVersions(const String &a, const String &b) {
   return 0;
 }
 
+// GitHub calls chain blocking timeouts (DNS, TCP, TLS, headers, a redirect)
+// that together can outlast the loop watchdog; widen it while one runs.
+struct SlowCall {
+  SlowCall() { esp_task_wdt_init(120, true); }
+  ~SlowCall() { esp_task_wdt_init(LOOP_WDT_S, true); }
+};
+
 static String fetchLatestVersion() {
+  SlowCall slow;
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(GITHUB_CA);
 #ifdef ESP32
   client.setTimeout(5);  // WiFiClientSecure uses seconds; HTTPClient uses milliseconds
   client.setHandshakeTimeout(5);
@@ -144,7 +180,31 @@ static String fetchLatestVersion() {
   return version;
 }
 
-// ── page builder helper ────────────────────────────────────────────────
+// ── page builder helpers ───────────────────────────────────────────────
+
+// With an admin password saved, every page and action asks for it (user
+// "admin"). Without one the UI stays open for first-time setup.
+static bool authorized() {
+  if (!_cfg.adminPass[0] || _server.authenticate("admin", _cfg.adminPass)) return true;
+  _server.requestAuthentication(BASIC_AUTH, "BambuTagger-Gateway");
+  return false;
+}
+
+// Config values are user input; escape before putting them into HTML.
+static String htmlEsc(const char *s) {
+  String out;
+  for (; *s; s++) {
+    switch (*s) {
+      case '&': out += F("&amp;"); break;
+      case '<': out += F("&lt;"); break;
+      case '>': out += F("&gt;"); break;
+      case '"': out += F("&quot;"); break;
+      default:  out += *s;
+    }
+  }
+  return out;
+}
+
 
 static String buildPage(const char *tmpl1, const char *tmpl2) {
   String page = FPSTR(tmpl1);
@@ -156,22 +216,15 @@ static String buildPage(const char *tmpl1, const char *tmpl2) {
 // ── page files ──────────────────────────────────────────────────────────
 
 #include "page_dashboard.h"
-#include "page_settings.h"
-#include "page_wifi.h"
 #include "page_ota.h"
 #include "page_saved.h"
-#include "page_cert.h"
-#include "page_setup.h"
 
 // ── handlers ───────────────────────────────────────────────────────────
 
 static void handleNotFound() {
-  String loc;
-  if (WiFi.getMode() == WIFI_AP) {
-    loc = "http://" + WiFi.softAPIP().toString();
-  } else {
-    loc = "http://" + WiFi.localIP().toString();
-  }
+  // Redirect to the interface the request arrived on (AP or STA); old
+  // multi-page URLs land here too.
+  String loc = "http://" + _server.client().localIP().toString() + "/";
   _server.sendHeader("Location", loc, true);
   _server.send(302, "text/html",
     "<html><body><a href=\"" + loc + "\">Continue</a></body></html>");
@@ -191,18 +244,11 @@ inline void webconfigInit() {
 inline void webconfigBegin() {
   _server.on("/", handleRoot);
   _server.on("/Logo/bambutagger.png", handleLogo);
-  _server.on("/cert", handleCert);
-  _server.on("/ca.pem", handleCaPem);
-  _server.on("/config", []() {
-    _server.sendHeader("Location", "/config/settings", true);
-    _server.send(302, "text/plain", "");
+  _server.on("/ca.pem", []() {  // used by tools/trust-gateway.sh
+    _server.send(200, "application/x-pem-file", mqtt.getTlsCert());
   });
-  _server.on("/config/settings", handleSettings);
-  _server.on("/config/wifi", handleWifi);
-  _server.on("/setup", handleSetup);
-  _server.on("/config/ota", handleOta);
   _server.on("/api/release", handleApiRelease);
-  _server.on("/update/github", handleUpdateFromGithub);
+  _server.on("/update/github", HTTP_POST, handleUpdateFromGithub);
   _server.on("/save", HTTP_POST, handleSave);
   _server.onNotFound(handleNotFound);
 

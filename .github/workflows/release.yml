@@ -44,6 +44,11 @@ jobs:
 
       - name: Build with PlatformIO
         run: |
+          # Tag builds report the tag (v1.2.3 -> 1.2.3) as their version, so the
+          # in-app update check compares against what is installed.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            export PLATFORMIO_BUILD_FLAGS="-DVERSION=\\\"${GITHUB_REF_NAME#v}\\\""
+          fi
           pio run -e esp32-s3
 
       - name: Fix firmware flash mode to QIO
@@ -120,8 +125,9 @@ jobs:
               0x10000  firmware.bin
             ```
 
-            ### OTA
-            Upload `firmware.bin` via the web interface (Configuration → OTA Update).
+            ### Over the network
+            Click **Check for update** on the gateway's web page, or use ArduinoOTA
+            (`espota.py -i <gateway-ip> -f firmware.bin`, plus `-a <admin password>` if one is set).
 
             > **Board:** Seeed XIAO ESP32-S3 (or any ESP32-S3 with ≥8 MB flash)
             > **Framework:** Arduino (PlatformIO)

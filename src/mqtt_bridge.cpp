@@ -1,4 +1,5 @@
 #include "mqtt_bridge.h"
+#include "tcp_proxy.h"  // freeSockets()
 #ifdef ESP32
 #include <ESPmDNS.h>
 #include <mbedtls/base64.h>
@@ -55,6 +56,7 @@ static void invalidateAesKeys(mbedtls_ssl_context *ssl) {
 }
 #endif
 
+static unsigned long pktStart;  // when the current local packet's header arrived
 static char reportTopic[64];
 static char requestTopic[64];
 static char localReportTopic[64];
@@ -141,8 +143,9 @@ void MqttBridge::begin(GatewayConfig *cfg) {
 #ifdef ESP32
   {
     // Free up old NVS namespaces
-    // Clear legacy NVS namespaces — intentionally excludes "mqttg40" (current)
-    for (const char *ns : {"mqttgate", "mqttg2", "mqttg3", "mqttg4", "mqttg5", "mqttg6", "mqttg7", "mqttg8", "mqttg9", "mqttg10", "mqttg11", "mqttg12", "mqttg13", "mqttg14", "mqttg15", "mqttg16", "mqttg17", "mqttg18", "mqttg19", "mqttg20", "mqttg21", "mqttg22", "mqttg23", "mqttg24", "mqttg25", "mqttg26", "mqttg27", "mqttg28", "mqttg29", "mqttg30", "mqttg31", "mqttg32", "mqttg33", "mqttg34", "mqttg35", "mqttg36", "mqttg37", "mqttg38", "mqttg39"}) {
+    // Clear legacy NVS namespaces — intentionally excludes "mqttg41" (current).
+    // mqttg40 held the 1.0.0 cert that expires 2027-01-01; it is regenerated.
+    for (const char *ns : {"mqttgate", "mqttg2", "mqttg3", "mqttg4", "mqttg5", "mqttg6", "mqttg7", "mqttg8", "mqttg9", "mqttg10", "mqttg11", "mqttg12", "mqttg13", "mqttg14", "mqttg15", "mqttg16", "mqttg17", "mqttg18", "mqttg19", "mqttg20", "mqttg21", "mqttg22", "mqttg23", "mqttg24", "mqttg25", "mqttg26", "mqttg27", "mqttg28", "mqttg29", "mqttg30", "mqttg31", "mqttg32", "mqttg33", "mqttg34", "mqttg35", "mqttg36", "mqttg37", "mqttg38", "mqttg39", "mqttg40"}) {
       Preferences oldPrefs;
       oldPrefs.begin(ns, false);
       oldPrefs.clear();
@@ -150,7 +153,7 @@ void MqttBridge::begin(GatewayConfig *cfg) {
     }
 
     Preferences prefs;
-            prefs.begin("mqttg40", false);
+            prefs.begin("mqttg41", false);
     _certLen = prefs.getBytes("certDer", _certDer, sizeof(_certDer));
     _keyLen = prefs.getBytes("keyDer", _keyDer, sizeof(_keyDer));
     _caLen = prefs.getBytes("caDer", _caDer, sizeof(_caDer));
@@ -166,13 +169,14 @@ void MqttBridge::begin(GatewayConfig *cfg) {
       IPAddress localIP = WiFi.isConnected() ? WiFi.localIP() : WiFi.softAPIP();
       Serial.printf("MQTT: generating cert with IP %s\n", localIP.toString().c_str());
       uint8_t ipBytes[4] = { localIP[0], localIP[1], localIP[2], localIP[3] };
-    if (!generateCertChain(_cfg->printerSerial, _certDer, &_certLen,
+    // CN = the serial SSDP advertises, as on a real printer's own cert.
+    if (!generateCertChain(_cfg->gatewaySerial, _certDer, &_certLen,
                               _keyDer, &_keyLen,
                               _caDer, &_caLen,
                               ipBytes)) {
         Serial.println("MQTT: cert generation failed!");
       } else {
-        prefs.begin("mqttg40", false);
+        prefs.begin("mqttg41", false);
         prefs.putBytes("certDer", _certDer, _certLen);
         prefs.putBytes("keyDer", _keyDer, _keyLen);
         prefs.putBytes("caDer", _caDer, _caLen);
@@ -207,17 +211,21 @@ void MqttBridge::loop() {
     // Attempt upstream MQTT connection (only if printer is configured and WiFi is up)
     if (WiFi.isConnected() && _cfg && strlen(_cfg->printerHost) > 0) {
       unsigned long now = millis();
-      if (now - _lastReconnect > UPSTREAM_RETRY_MS) {
+      if (now - _lastReconnect > _retryMs) {
         if (connectUpstream()) {
 #ifdef ESP32
           invalidateAesKeys(_upSslCtx);
 #endif
-          char sn[64];
-          strncpy(sn, _cfg->printerSerial, sizeof(sn) - 1);
-          sn[sizeof(sn) - 1] = 0;
-          char topic[64];
-          snprintf(topic, sizeof(topic), "device/%s/report", sn);
-          _pubsub.subscribe(topic, 0);
+          _retryMs = UPSTREAM_RETRY_MS;
+          _pubsub.subscribe(reportTopic, 0);
+          // Restore what local clients asked for before the printer dropped.
+          for (int i = 0; i < MAX_MQTT_CLIENTS; i++)
+            for (uint8_t s = 0; _clients[i].active && s < _clients[i].subCount; s++)
+              _pubsub.subscribe(upstreamTopic(_clients[i].subs[s].topic).c_str(), _clients[i].subs[s].qos);
+        } else {
+          // Each failed attempt blocks the loop for seconds (TCP/TLS timeouts),
+          // so back off while the printer is off.
+          _retryMs = min(_retryMs * 2, UPSTREAM_RETRY_MAX_MS);
         }
         _lastReconnect = millis();  // allow a full retry delay after blocking I/O
       }
@@ -232,7 +240,7 @@ void MqttBridge::loop() {
 
   int ac;
   while ((ac = acceptClient()) >= 0) {}
-  if (ac < -1) Serial.printf("MQTT: acceptClient returned %d\n", ac);
+  if (ac < -1) Serial.printf("MQTT: acceptClient returned %d (-2 slots full, -3 socket reserve)\n", ac);
 
   static unsigned long lastDiag = 0;
   unsigned long now = millis();
@@ -260,6 +268,15 @@ void MqttBridge::loop() {
   for (int i = 0; i < MAX_MQTT_CLIENTS; i++) {
     if (!_clients[i].active) continue;
 
+    // MQTT 3.1.1 §3.1.2.10: drop clients silent for 1.5x keepalive. Half-open
+    // sockets (phone left WiFi) otherwise hold one of the 8 slots forever.
+    if (_clients[i].keepAlive &&
+        millis() - _clients[i].lastActivity > _clients[i].keepAlive * 1500UL) {
+      Serial.printf("MQTT: client %d keepalive timeout\n", i);
+      disconnectClient(i);
+      continue;
+    }
+
     // Continue TLS handshake for pending clients
     if (_clients[i].isTls) {
       TlsWiFiClient *tls = (TlsWiFiClient *)_clients[i].client;
@@ -276,7 +293,8 @@ void MqttBridge::loop() {
       }
     }
 
-    if (!_clients[i].client->connected()) {
+    bool open = _clients[i].isTls ? _clients[i].client->connected() : peerOpen(*_clients[i].client);
+    if (!open) {
       disconnectClient(i);
       continue;
     }
@@ -348,9 +366,14 @@ bool MqttBridge::connectUpstream() {
 #ifdef ESP32
     char error[160] = {};
     int code = _upTcp->lastError(error, sizeof(error));
-    Serial.printf("MQTT: TCP/TLS connection failed (%d): %s; retry in 60s\n", code, error);
+    Serial.printf("MQTT: TCP/TLS connection failed (%d): %s\n", code, error);
+    if (code == -1)  // TCP connect failed: printer off, asleep or wrong IP
+      strlcpy(_upErr, "printer unreachable (powered off or wrong IP?)", sizeof(_upErr));
+    else
+      snprintf(_upErr, sizeof(_upErr), "TLS %d: %s", code, error);
 #else
-    Serial.println("MQTT: TCP/TLS connection failed; retry in 60s");
+    Serial.println("MQTT: TCP/TLS connection failed");
+    strlcpy(_upErr, "TLS/TCP connect failed", sizeof(_upErr));
 #endif
     _upTcp->stop();
     return false;
@@ -366,10 +389,54 @@ bool MqttBridge::connectUpstream() {
 
   // The printer owns its availability topic. No retained status or last will.
   bool ok = _pubsub.connect(clientId, "bblp", _cfg->printerCode);
-  Serial.printf("MQTT: upstream CONNECT result=%d (0=connected, -4=timeout, 4=credentials, 5=unauthorized)\n",
-                _pubsub.state());
+  int st = _pubsub.state();
+  Serial.printf("MQTT: upstream CONNECT result=%d (0=connected, -4=timeout, 4=credentials, 5=unauthorized)\n", st);
+  if (ok) _upErr[0] = 0;
+  else snprintf(_upErr, sizeof(_upErr), "MQTT CONNECT rc=%d%s", st,
+                (st == 4 || st == 5) ? " (access code rejected)" : "");
   return ok;
 }
+
+// Clients may address the gateway serial; the printer only knows its own.
+String MqttBridge::upstreamTopic(const String &topic) {
+  if (!_cfg || strcmp(_cfg->gatewaySerial, _cfg->printerSerial) == 0) return topic;
+  String pfx = String("device/") + _cfg->gatewaySerial;
+  if (!topic.startsWith(pfx)) return topic;
+  return String("device/") + _cfg->printerSerial + topic.substring(pfx.length());
+}
+
+int MqttBridge::clientCount() {
+  int n = 0;
+  for (int i = 0; i < MAX_MQTT_CLIENTS; i++) n += _clients[i].active && _clients[i].authed;
+  return n;
+}
+
+// CONNECT variable header + payload (MQTT 3.1 and 3.1.1). False if malformed;
+// pass is empty when the client sent no password.
+bool parseConnect(const uint8_t *b, size_t n, uint16_t &keepAlive,
+                  String &clientId, String &pass) {
+  size_t off = 0;
+  auto field = [&](String *out) {
+    if (off + 2 > n) return false;
+    size_t len = (b[off] << 8) | b[off + 1];
+    off += 2;
+    if (off + len > n) return false;
+    if (out) *out = String((const char *)b + off, len);
+    off += len;
+    return true;
+  };
+  if (!field(nullptr) || off + 4 > n) return false;  // protocol name
+  uint8_t flags = b[off + 1];                        // b[off] is the level
+  keepAlive = (b[off + 2] << 8) | b[off + 3];
+  off += 4;
+  if (!field(&clientId)) return false;
+  if ((flags & 0x04) && !(field(nullptr) && field(nullptr))) return false;  // will topic + message
+  if ((flags & 0x80) && !field(nullptr)) return false;                      // username
+  pass = "";
+  if ((flags & 0x40) && !field(&pass)) return false;
+  return true;
+}
+// end parseConnect
 
 static bool topicMatchesSub(const String &topic, const String &sub) {
   int ti = 0, si = 0;
@@ -441,31 +508,16 @@ int MqttBridge::acceptClient() {
     WiFiClient raw = _tlsServer.accept();
     if (raw) {
       if (!raw.connected()) { raw.stop(); return -1; }
+      if (freeSockets() < socketReserve()) { raw.stop(); return -3; }
       raw.setNoDelay(true);
       Serial.printf("MQTT: accept from %s:%d -> %s:%d\n",
                     raw.remoteIP().toString().c_str(), raw.remotePort(),
                     raw.localIP().toString().c_str(), raw.localPort());
 
-      // Wait for first byte — need to delay slightly to let Bambu Studio
-      // send the TLS ClientHello before we try to do TLS handshake.
-      int peeked = -1;
-      for (int w = 0; w < 20; w++) {
-        if (!raw.connected()) { raw.stop(); return -1; }
-        if (raw.available() > 0) {
-          peeked = raw.read();
-          break;
-        }
-        delay(5);
-      }
-
-      if (peeked < 0) {
-        Serial.printf("MQTT: probe from %s:%d (closing)\n",
-                      raw.remoteIP().toString().c_str(), raw.remotePort());
-        raw.stop();
-        return -1;
-      }
-
-      // Client sent data — restore the byte and do TLS
+      // Don't wait for the ClientHello here: the handshake is non-blocking (30 s
+      // limit) and silent sockets are reaped by the CONNECT keepalive. The old
+      // 100 ms wait dropped real clients whenever WiFi latency spiked past it.
+      IPAddress ip = raw.remoteIP();
       WiFiClient *rawTcp = new WiFiClient(raw);
       TlsWiFiClient *tls = new TlsWiFiClient();
       if (!tls->beginDer(rawTcp, _certDer, _certLen, _keyDer, _keyLen)) {
@@ -473,9 +525,6 @@ int MqttBridge::acceptClient() {
         delete tls;
         return -1;
       }
-
-      // Feed the peeked byte back through the TLS client
-      tls->feedData((uint8_t)peeked);
 
       for (int i = 0; i < MAX_MQTT_CLIENTS; i++) {
         if (!_clients[i].active) {
@@ -485,6 +534,9 @@ int MqttBridge::acceptClient() {
           _clients[i].subCount = 0;
           _clients[i].lastPid = 0;
           _clients[i].lastActivity = millis();
+          _clients[i].keepAlive = CONNECT_WAIT_S;
+          _clients[i].authed = false;
+          _clients[i].ip = ip;
           Serial.printf("MQTT: TLS client %d from %s\n", i, raw.remoteIP().toString().c_str());
           return i;
         }
@@ -498,6 +550,7 @@ int MqttBridge::acceptClient() {
   {
     WiFiClient plain = _localServer.accept();
     if (!plain) return -1;
+    if (freeSockets() < socketReserve()) { plain.stop(); return -3; }
 
     WiFiClient *c = new WiFiClient(plain);
     if (!c || !c->connected()) {
@@ -515,6 +568,9 @@ int MqttBridge::acceptClient() {
         _clients[i].subCount = 0;
         _clients[i].lastPid = 0;
         _clients[i].lastActivity = millis();
+        _clients[i].keepAlive = CONNECT_WAIT_S;
+        _clients[i].authed = false;
+        _clients[i].ip = c->remoteIP();
         return i;
       }
     }
@@ -552,7 +608,7 @@ void MqttBridge::handleClient(int idx) {
   int headerRead = c.read();
   if (headerRead < 0) { return; }
   header = (uint8_t)headerRead;
-  cl.lastActivity = millis();
+  cl.lastActivity = pktStart = millis();
 
   // Log first MQTT packet type from each client
   static bool logged[8] = {};
@@ -563,43 +619,29 @@ void MqttBridge::handleClient(int idx) {
   }
 
   uint8_t type = (header >> 4) & 0x0F;
+  if (type != 1 && !cl.authed) {  // nothing reaches the printer before a valid CONNECT
+    disconnectClient(idx);
+    return;
+  }
   uint32_t remaining = 0;
   if (!readRemainingLength(c, remaining)) return;
 
   switch (type) {
     case 1: { // CONNECT
       if (remaining > 4096) { disconnectClient(idx); return; }
-      // Dump CONNECT variable header + payload
       uint8_t *connBuf = new uint8_t[remaining + 1];
-      size_t connPos = 0;
-      while (remaining > 0) {
-        uint32_t chunk = (remaining > 32) ? 32 : remaining;
-        if (!readBytes(c, connBuf + connPos, chunk)) { delete[] connBuf; return; }
-        connPos += chunk;
-        remaining -= chunk;
-      }
-      connBuf[connPos] = 0;
-
-      // Parse CONNECT fields
-      if (connPos >= 6) {
-        int off = 0;
-        uint16_t pnLen = (connBuf[off] << 8) | connBuf[off+1]; off += 2;
-        String protoName = String((char *)(connBuf + off), pnLen); off += pnLen;
-        uint8_t level = connBuf[off++];
-        uint8_t flags = connBuf[off++];  // bit 0: reserved, 1: clean, 2: will, 3: willQos1, 4: willQos2, 5: willRetain, 6: pwd, 7: user
-        uint16_t keepalive = (connBuf[off] << 8) | connBuf[off+1]; off += 2;
-        // Client ID
-        uint16_t cidLen = connPos > off + 1 ? (connBuf[off] << 8) | connBuf[off+1] : 0; off += 2;
-        String clientId;
-        if (cidLen > 0 && off + cidLen <= connPos) {
-          clientId = String((char *)(connBuf + off), cidLen); off += cidLen;
-        }
-        Serial.printf("MQTT: CONNECT proto=%s level=%u flags=0x%02x keepalive=%u cid='%s'\n",
-                      protoName.c_str(), level, flags, keepalive, clientId.c_str());
-      }
+      if (!readBytes(c, connBuf, remaining)) { delete[] connBuf; return; }
+      uint16_t keepalive = 0;
+      String clientId, pass;
+      bool parsed = parseConnect(connBuf, remaining, keepalive, clientId, pass);
       delete[] connBuf;
-
-      size_t wret = sendConnAck(c, false, 0);
+      if (!parsed) { disconnectClient(idx); return; }
+      cl.keepAlive = keepalive;
+      // Same credential as the printer itself: its access code.
+      cl.authed = _cfg && pass == _cfg->printerCode;
+      Serial.printf("MQTT: CONNECT client %d cid='%s' keepalive=%u auth=%s\n",
+                    idx, clientId.c_str(), keepalive, cl.authed ? "ok" : "REJECTED");
+      size_t wret = sendConnAck(c, false, cl.authed ? 0 : 5);  // 5 = not authorized
       Serial.printf("MQTT: ConnAck write returned %u bytes\n", (unsigned)wret);
       // Flush pending TLS writes so the client receives ConnAck promptly
       if (cl.isTls) {
@@ -609,6 +651,11 @@ void MqttBridge::handleClient(int idx) {
         // Do not probe for client data here. HA deliberately waits for CONNACK;
         // a speculative TLS read reports WANT_READ as a disconnect in this client.
         Serial.println("MQTT: ConnAck flushed");
+      }
+      if (!cl.authed) {
+        _authRejects++;
+        _lastRejectIp = cl.ip;
+        disconnectClient(idx);
       }
       break;
     }
@@ -751,13 +798,7 @@ void MqttBridge::handleClient(int idx) {
           cl.subs[cl.subCount].qos = subOpts & 0x03;
           cl.subCount++;
         }
-        // Translate gateway serial to printer serial in the subscription topic
-        String upTopic = subTopic;
-        if (_cfg && strcmp(_cfg->gatewaySerial, _cfg->printerSerial) != 0) {
-          String pfx = String("device/") + _cfg->gatewaySerial;
-          if (upTopic.startsWith(pfx))
-            upTopic = String("device/") + _cfg->printerSerial + upTopic.substring(pfx.length());
-        }
+        String upTopic = upstreamTopic(subTopic);
         bool subOk = _pubsub.subscribe(upTopic.c_str(), subOpts & 0x03);
         Serial.printf("MQTT: sub topic='%s' -> up='%s' ok=%d\n",
                       subTopic.c_str(), upTopic.c_str(), subOk);
@@ -831,13 +872,7 @@ void MqttBridge::handleClient(int idx) {
           }
         }
         if (!stillWanted) {
-          String upTopic = unsubTopic;
-          if (_cfg && strcmp(_cfg->gatewaySerial, _cfg->printerSerial) != 0) {
-            String pfx = String("device/") + _cfg->gatewaySerial;
-            if (upTopic.startsWith(pfx))
-              upTopic = String("device/") + _cfg->printerSerial + upTopic.substring(pfx.length());
-          }
-          _pubsub.unsubscribe(upTopic.c_str());
+          _pubsub.unsubscribe(upstreamTopic(unsubTopic).c_str());
         }
       }
 
@@ -924,16 +959,7 @@ void MqttBridge::sendPublish(WiFiClient &c, const String &topic,
 // wire-level helpers
 // ------------------------------------------------------------------
 bool MqttBridge::readByte(WiFiClient &c, uint8_t &b) {
-  int v = c.read();
-  if (v >= 0) { b = (uint8_t)v; return true; }
-  // Retry with short delays — gives TLS data time to arrive and decrypt
-  for (int i = 0; i < 10; i++) {
-    delay(5);
-    v = c.read();
-    if (v >= 0) { b = (uint8_t)v; return true; }
-    if (!c.connected()) break;
-  }
-  return false;
+  return readBytes(c, &b, 1);
 }
 
 bool MqttBridge::readRemainingLength(WiFiClient &c, uint32_t &len) {
@@ -949,12 +975,22 @@ bool MqttBridge::readRemainingLength(WiFiClient &c, uint32_t &len) {
   return false;
 }
 
+// A packet split across TCP segments is normal; wait for the rest. If it never
+// comes, close the socket (loop() reaps it) rather than parse mid-packet bytes
+// as a new header. The budget is per packet: topics are read byte by byte, so
+// a per-call timeout would let a slow client hold loop() past the watchdog.
 bool MqttBridge::readBytes(WiFiClient &c, uint8_t *buf, uint32_t len) {
   while (len > 0) {
     int got = c.read(buf, len);
-    if (got <= 0) return false;
-    buf += got;
-    len -= got;
+    if (got > 0) {
+      buf += got;
+      len -= got;
+    } else if (!c.connected() || millis() - pktStart > MQTT_PACKET_MS) {
+      c.stop();
+      return false;
+    } else {
+      delay(1);
+    }
   }
   return true;
 }

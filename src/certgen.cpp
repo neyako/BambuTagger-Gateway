@@ -17,6 +17,11 @@
 #define OID_BAMBU_1_999 "\x2B\x06\x01\x04\x01\x86\x9A\xC3\xED\x49\x01\x87\x67"
 
 #define CA_SUBJECT "C=CN, O=BBL Technologies Co. Ltd, CN=BBL Device CA N7-V2"  // original subject for testing
+// The device has no RTC, so validity can't be renewed in the field. 1.0.0 used
+// 2026-2027, which every date-checking client would reject from 2027-01-01.
+// 2049 is the last year X.509 encodes as UTCTime.
+#define CERT_NOT_BEFORE "20260101000000"
+#define CERT_NOT_AFTER  "20491231235959"
 
 static int addBambuExtensions(mbedtls_x509write_cert *crt) {
   int ret;
@@ -160,7 +165,7 @@ bool generateCertChain(const char *cn, uint8_t *certDer, size_t *certLen,
     { mbedtls_mpi s; mbedtls_mpi_init(&s); mbedtls_mpi_lset(&s, 1); ret = mbedtls_x509write_crt_set_serial(&caCrt, &s); mbedtls_mpi_free(&s); if (ret) break; }
 #endif
 
-    ret = mbedtls_x509write_crt_set_validity(&caCrt, "20260101000000", "20270101000000");
+    ret = mbedtls_x509write_crt_set_validity(&caCrt, CERT_NOT_BEFORE, CERT_NOT_AFTER);
     if (ret) { printf("CERT: CA validity failed -0x%x\n", -ret); break; }
 
     ret = mbedtls_x509write_crt_set_issuer_name(&caCrt, CA_SUBJECT);
@@ -201,7 +206,7 @@ bool generateCertChain(const char *cn, uint8_t *certDer, size_t *certLen,
     { mbedtls_mpi s; mbedtls_mpi_init(&s); mbedtls_mpi_lset(&s, 2); ret = mbedtls_x509write_crt_set_serial(&devCrt, &s); mbedtls_mpi_free(&s); if (ret) break; }
 #endif
 
-    ret = mbedtls_x509write_crt_set_validity(&devCrt, "20260101000000", "20270101000000");
+    ret = mbedtls_x509write_crt_set_validity(&devCrt, CERT_NOT_BEFORE, CERT_NOT_AFTER);
     if (ret) { printf("CERT: dev validity failed -0x%x\n", -ret); break; }
 
     ret = mbedtls_x509write_crt_set_issuer_name(&devCrt, CA_SUBJECT);

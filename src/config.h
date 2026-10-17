@@ -6,19 +6,24 @@
 #include <ESP8266WiFi.h>
 #endif
 
-#define VERSION "1.0.0"
+// CI tag builds pass -DVERSION="<tag>" so the update check compares against
+// what is actually installed.
+#ifndef VERSION
+#define VERSION "1.1.0"
+#endif
 
 // ── Runtime config (stored in EEPROM) ─────────────────────────────────
 #pragma pack(push, 1)
 struct GatewayConfig {
   uint8_t magic;
-  char stationSsid[32];
+  char stationSsid[33];    // SSIDs may be 32 chars
   char stationPass[64];
   char printerHost[64];
   char printerCode[32];
   char printerSerial[32];
   char gatewaySerial[32];
   char printerModel[24];
+  char adminPass[64];      // empty: web UI, ArduinoOTA and setup AP are open
 };
 #pragma pack(pop)
 
@@ -48,8 +53,14 @@ struct GatewayConfig {
 // Limits
 #define MAX_MQTT_CLIENTS      8
 #define MAX_TCP_CLIENTS       6
+#define SOCKET_RESERVE        2        // kept free while the printer link is down: its reconnect + web UI
+#define MQTT_PACKET_MS        2000UL   // whole local packet must arrive within this
+#define HALF_CLOSE_IDLE_MS    10000UL  // relay pair with one side done and no traffic: close
+#define LOOP_WDT_S            30       // loop() watchdog
 #define MQTT_BUFFER_SIZE      20480
+#define CONNECT_WAIT_S        20       // keepalive before CONNECT arrives (1.5x = 30 s)
 #define UPSTREAM_RETRY_MS     10000UL  // recover quickly after printer-side disconnect
+#define UPSTREAM_RETRY_MAX_MS 60000UL  // backoff cap while the printer is off
 
 // MQTT topics
 #define MQTT_REPORT_TOPIC     "device/%s/report"

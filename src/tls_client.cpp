@@ -1,4 +1,5 @@
 #include "tls_client.h"
+#include "tcp_proxy.h"  // peerOpen()
 #include <string.h>
 #include <mbedtls/error.h>
 #include <mbedtls/cipher.h>
@@ -396,7 +397,7 @@ void TlsWiFiClient::clearKeyInHardware() {
 }
 
 uint8_t TlsWiFiClient::connected() {
-  return _ok && _tcp && _tcp->connected();
+  return _ok && _tcp && (available() > 0 || peerOpen(*_tcp));
 }
 
 TlsWiFiClient::operator bool() { return _ok && _tcp && (*_tcp); }
