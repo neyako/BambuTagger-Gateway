@@ -10,6 +10,9 @@
 #include <lwip/igmp.h>
 #ifdef ESP32
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
 #endif
 
 #include "config.h"
@@ -158,39 +161,73 @@ static void loopSSDP(const GatewayConfig *cfg) {
   }
 }
 
-static void startAP(uint8_t mode = WIFI_AP_STA) {
-  WiFi.persistent(false);
-  WiFi.mode((WiFiMode_t)mode);
-  delay(100);
-  WiFi.setSleep(false);
-  delay(100);
-  if (!WiFi.softAP("BambuTagger-Gateway")) {
+// WiFi policy. Without saved credentials the setup AP stays up. With them, STA
+// retries forever and the setup AP is a bounded fallback that is never on while
+// STA is connected. The core's auto-reconnect alone is not enough: it stops for
+// good on reasons outside its whitelist (e.g. AUTH_FAIL from a booting router).
+// Fixed, no backoff: one connect attempt failing right after the router returns
+// (seen on hardware) must still leave a rejoin within ~1 minute.
+#define STA_RETRY_MS       30000UL
+#define AP_AFTER_BOOT_MS   (2 * 60000UL)    // not connected since boot (router slow, wrong password)
+#define AP_AFTER_LOSS_MS   (10 * 60000UL)   // was connected, then lost
+#define AP_WINDOW_MS       (5 * 60000UL)
+
+static void apOn() {
+  // Open for first-time setup; WPA2 with the admin password once one is set.
+  const char *admin = webconfigGetConfig()->adminPass;
+  if (!WiFi.softAP(GATEWAY_AP_SSID, admin[0] ? admin : GATEWAY_AP_PASS, GATEWAY_AP_CHANNEL)) {
     Serial.println("AP FAILED");
     return;
   }
-  Serial.printf("AP: %s  IP: %s  mode: %d\n",
-    "BambuTagger-Gateway",
-    WiFi.softAPIP().toString().c_str(),
-    WiFi.getMode());
+  Serial.printf("AP: %s up at %s\n", GATEWAY_AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
-static void manageAP() {
-  bool staConnected = WiFi.isConnected();
-  auto mode = WiFi.getMode();
-  static bool apStopped = false;
+static void apOff() {
+  WiFi.softAPdisconnect(true);  // back to STA-only
+  Serial.println("AP: off");
+}
 
-  if (staConnected && !apStopped && mode == WIFI_AP_STA) {
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    apStopped = true;
-    Serial.println("AP stopped (station connected)");
-  } else if (!staConnected && mode == WIFI_STA && strlen(webconfigGetConfig()->stationSsid) > 0) {
-    apStopped = false;
-    WiFi.mode(WIFI_AP_STA);
-    startAP();
-    Serial.println("Station lost — AP restarted");
+static void wifiLoop() {
+  const GatewayConfig *cfg = webconfigGetConfig();
+  if (!cfg->stationSsid[0]) return;
+
+  static unsigned long downSince = 0, lastTry = 0, apSince = 0;
+  static bool everUp = false;
+  unsigned long now = millis();
+  bool apUp = WiFi.getMode() & WIFI_MODE_AP;
+
+  if (WiFi.isConnected()) {
+    everUp = true;
+    downSince = lastTry = now;  // first retry after a loss is left to the core
+    if (apUp) apOff();
+    return;
+  }
+
+  if (now - lastTry >= STA_RETRY_MS) {
+    lastTry = now;
+    Serial.printf("WiFi: retrying %s (status %d)\n", cfg->stationSsid, WiFi.status());
+    WiFi.disconnect();
+    WiFi.begin(cfg->stationSsid, cfg->stationPass);
+  }
+
+  if (!apUp && now - downSince >= (everUp ? AP_AFTER_LOSS_MS : AP_AFTER_BOOT_MS)) {
+    apOn();
+    apSince = now;
+  } else if (apUp && now - apSince >= AP_WINDOW_MS) {
+    apOff();
+    downSince = now;  // STA keeps retrying; AP returns after another full wait
   }
 }
+
+#ifdef ESP32
+// This core's mbedTLS allocates internal RAM only: ~48 KB per TLS session, so
+// 3-4 TLS clients exhausted the heap and the printer link could not reconnect.
+// Same as IDF's CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: use PSRAM, internal fallback.
+static void *tlsCalloc(size_t n, size_t size) {
+  void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+#endif
 
 // XIAO ESP32-S3: built-in LED on GPIO21, active LOW (LED_BUILTIN from variant).
 #ifndef LED_BUILTIN
@@ -233,18 +270,26 @@ void setup() {
   Serial.println("\n\nBambuTagger Gateway " VERSION);
 
   ledSetup();
+#ifdef ESP32
+  if (psramFound()) mbedtls_platform_set_calloc_free(tlsCalloc, free);
+  Serial.printf("PSRAM: %u bytes\n", ESP.getPsramSize());
+#endif
 
   // Load config first (EEPROM only, no lwIP needed)
   webconfigInit();
   GatewayConfig *cfg = webconfigGetConfig();
 
-  // Start WiFi in AP or AP+STA mode depending on whether station is configured.
-  if (strlen(cfg->stationSsid) > 0) {
-    startAP(WIFI_AP_STA);
+  // STA only when credentials are saved (wifiLoop opens the AP if STA stays
+  // down); setup AP only when they are not.
+  WiFi.persistent(false);  // retries must not rewrite NVS
+  if (cfg->stationSsid[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
     Serial.printf("Connecting to WiFi: %s\n", cfg->stationSsid);
     WiFi.begin(cfg->stationSsid, cfg->stationPass);
   } else {
-    startAP();
+    WiFi.mode(WIFI_AP);
+    apOn();
     Serial.println("No station configured — AP only");
   }
 
@@ -257,7 +302,6 @@ void setup() {
   camProxy.setRemote(cfg->printerHost, CAM_PRINTER_PORT);
   ftpsProxy.setRemote(cfg->printerHost, FTPS_PRINTER_PORT);
 
-  Serial.printf("Web UI at http://%s (initial AP, moves to STA)\n", WiFi.softAPIP().toString().c_str());
   Serial.print("Printer: ");
   Serial.print(cfg->printerHost);
   Serial.print("  Serial: ");
@@ -267,9 +311,12 @@ void setup() {
   ftpsProxy.begin();
   Serial.printf("MQTT TLS server on port %d\n", MQTT_PRINTER_PORT);
 
-  Serial.printf("Gateway AP: %s\n", GATEWAY_AP_SSID);
-  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+
+  // A hang anywhere in loop() now reboots instead of needing a power cycle.
+  // 30 s covers the longest blocking call (upstream TLS connect, update check).
+  esp_task_wdt_init(30, true);
+  enableLoopWDT();
   Serial.println("Ready.");
 }
 
@@ -310,15 +357,19 @@ static void startStationServices(GatewayConfig *cfg) {
   if (MDNS.begin(mdnsName)) {
     MDNS.addService("bambu", "tcp", MQTT_PRINTER_PORT);
     MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"product", (const char *)cfg->printerModel);
-    MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"serial", (const char *)cfg->printerSerial);
+    // Same identity as SSDP: advertise the gateway, not the physical printer.
+    MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"serial", (const char *)cfg->gatewaySerial);
     MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"fw_version", (const char *)VERSION);
     MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"cloud", (const char *)"disable");
     MDNS.addServiceTxt((const char *)"bambu", (const char *)"tcp", (const char *)"usb", (const char *)"no");
   }
 
   ArduinoOTA.setHostname(mdnsName);
+  if (cfg->adminPass[0]) ArduinoOTA.setPassword(cfg->adminPass);
   ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: end"); });
+  // The upload runs inside loop() and can outlast the 30 s loop watchdog.
+  ArduinoOTA.onProgress([](unsigned, unsigned) { esp_task_wdt_reset(); });
   ArduinoOTA.onError([](ota_error_t err) {
     Serial.printf("OTA: error %d\n", err);
   });
@@ -331,7 +382,7 @@ static void startStationServices(GatewayConfig *cfg) {
 
 void loop() {
   webconfigLoop();
-  manageAP();
+  wifiLoop();
 
   // Debug AP status every 2 seconds
   static int lastStaCount = -1;

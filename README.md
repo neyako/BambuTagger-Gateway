@@ -24,27 +24,27 @@ pio run -e esp32-s3 -t upload --upload-port /dev/ttyACM0
 
 ### 2. Connect to the Gateway
 
-After boot, the gateway creates a WiFi network named **`BambuTagger-Gateway`** (open). Connect your computer or phone to it, then open **http://192.168.4.1** in a browser.
+On first boot (no WiFi saved), the gateway creates an open WiFi network named **`BambuTagger-Gateway`**. Connect your computer or phone to it, then open **http://192.168.4.1** in a browser.
+
+Once home WiFi is saved, the gateway only uses it and keeps retrying it forever (every 30 s). The setup network is a fallback: it appears only while home WiFi has been down for 2 minutes after boot (10 minutes after a connection loss), stays for 5 minutes, and disappears as soon as home WiFi connects.
 
 ### 3. Configure Printer Settings
 
-From the web UI, go to the **Printer** page and enter:
+The web UI is a single page. Under **Settings**, enter your home WiFi and:
 - **Hostname / IP** — your printer's LAN IP address
 - **Access Code** — 8-digit code from your printer's Settings → Network page
 - **Serial Number** — found in Settings → General → Machine Info
 - **Printer Model** — your printer model (P1S, X1C, A1, etc.)
 
-Click **Save & Reboot**. After reboot, check the Dashboard — **Printer Link** should show "connected" and the gateway's LED should turn off.
+Click **Save & Reboot**. After reboot, open the gateway's new IP — **Printer link** should show "connected" (if not, the last connection error is shown under it) and the gateway's LED should turn off. Saved passwords and the access code are never shown again; leave those fields blank to keep them.
 
 ### 4. Set Up Bambu Studio
 
 Open Bambu Studio → **Prepare** tab → click the printer icon → **Add Printer**. Select your model, choose **LAN** mode, and enter:
-- **IP Address**: the gateway's IP (shown on the Dashboard)
+- **IP Address**: the gateway's IP (shown on the web page)
 - **Access Code**: your printer's access code
 
-The gateway will relay all traffic (MQTT, camera, file transfer) to the real printer transparently. No certificate import is needed — TLS is end-to-end encrypted with the printer's own certificate.
-
-> For detailed steps, open the **Guide** page in the web UI.
+The gateway relays MQTT, camera and file transfer to the real printer. MQTT clients must log in with the printer's access code (user `bblp`), exactly as with a real printer. On port 8883 the gateway presents its own TLS certificate; if a client insists on verifying it, `tools/trust-gateway.sh <gateway-ip>` adds the gateway's CA (`/ca.pem`) to Bambu Studio's trust store.
 
 ---
 
@@ -52,17 +52,18 @@ The gateway will relay all traffic (MQTT, camera, file transfer) to the real pri
 
 | Category | Details |
 |---|---|
-| **MQTT multiplexer** | One upstream MQTT connection to the printer; up to 8 local clients can subscribe/publish simultaneously via the gateway (port 1883) |
-| **TLS passthrough** | Port 8883 transparently relays TCP to the printer — Bambu Studio connects with end-to-end TLS, no certificate configuration needed |
-| **Camera broadcast** | Single upstream connection to printer camera stream; broadcasts to all connected local clients |
-| **FTPS forwarder** | Single upstream FTPS connection; forwards control/data to local clients |
-| **WiFi AP mode** | Creates `BambuTagger-Gateway` access point — clients connect directly to the gateway, no LAN reconfiguration needed |
-| **Station mode** | Optionally joins your existing WiFi network alongside the AP |
+| **MQTT multiplexer** | One upstream MQTT connection to the printer shared by up to 8 local clients, on 1883 (plain) and 8883 (TLS, terminated by the gateway). Clients log in with the printer's access code |
+| **Camera / FTPS relay** | Ports 6000 and 990 are end-to-end TLS, so each local client gets its own printer connection, opened only while that client is connected |
+| **WiFi setup AP** | Open `BambuTagger-Gateway` access point for first-time setup, and a time-limited fallback when home WiFi is down |
+| **Station mode** | Joins your WiFi and retries it forever with backoff; the setup AP is never on while connected |
 | **mDNS** | Advertises as `BambuTagger-Gateway.local` with `_bambu._tcp` (TXT: serial, model, version) for Bambu Studio discovery |
 | **Auto-resubscribe** | Tracks all client subscriptions; re-subscribes upstream on reconnect |
 | **Topic-aware routing** | Correctly handles `#`, `+` wildcards when forwarding printer reports to local clients |
-| **Web UI** | Dashboard, Printer settings, WiFi settings, firmware update — served from the gateway |
-| **Auto-update** | One-click firmware update from latest GitHub release |
+| **Web UI** | One page: status, gateway identity, settings, firmware update. Secrets are never sent back to the browser |
+| **Auto-update** | One-click firmware update from the latest GitHub release, over TLS verified against pinned root CAs |
+| **Security** | Optional admin password protects the web page (user `admin`), ArduinoOTA and the setup AP (WPA2) |
+| **Self-healing** | 30 s loop watchdog, socket reserve so a full gateway can still reach the printer and serve the page, keepalive reaping of dead clients |
+| **Diagnostics** | Page shows the last printer-link error, client and socket counts, and the last reset reason with crash backtrace |
 | **Fake printer mode** | Responds to Bambu Studio MQTT queries (model, serial, idle status) on any `device/X/request` topic when no real printer is connected; sends printer identity immediately on subscribe for auto-detection |
 | **Status LED** | Built-in LED indicates WiFi/MQTT connection state at a glance |
 
@@ -81,8 +82,8 @@ Bambu Lab printers accept **3 simultaneous connections**. Once that limit is hit
 │ MQTT Client 2    │──┼──>│  │ (plain 1883,       │──┼──┼──>│  │ MQTT 8883 │  │
 │ MQTT Client 3    │  │   │  │  upstream TLS)     │  │  │   │  ├───────────┤  │
 │      ...         │  │   │  ├────────────────────┤  │  │   │  │ Camera    │  │
-│ MQTT Client 8    │  │   │  │ TLS Passthrough    │  │  │   │  │ Stream    │  │
-├──────────────────┤  │   │  │ (8883 → printer)   │──┘  │   │  ├───────────┤  │
+│ MQTT Client 8    │  │   │  │ (TLS 8883, same    │  │  │   │  │ Stream    │  │
+├──────────────────┤  │   │  │  bridge)           │──┘  │   │  ├───────────┤  │
 │ Camera Client    │──┼──>│  ├────────────────────┤     │   │  │ FTPS 990  │  │
 │ Camera Client    │  │   │  │ Camera Proxy       │─────┼──>│  └───────────┘  │
 │      ...         │  │   │  │ (6000 → printer)   │     │   │                 │
@@ -91,12 +92,10 @@ Bambu Lab printers accept **3 simultaneous connections**. Once that limit is hit
 │ FTP Client       │──┼──>│  │ (990 → printer)    │     │   │                 │
 │ FTP Client       │  │   │  └────────────────────┘     │   │                 │
 │      ...         │  │   │                             │   │                 │
-└──────────────────┘  │   └─────────────────────────────┘   └─────────────────┘
-                      └── TLS passthrough: end-to-end encrypted with ──┘
-                         printer's BBL-signed certificate
+└──────────────────┘      └─────────────────────────────┘   └─────────────────┘
 ```
 
-> **Printer sees:** 1 upstream MQTT (bridge) + 1 Studio MQTT (passthrough) + 1 camera + 1 FTPS = **up to 4 connections** (well within the 3-per-service limit; the passthrough shares the printer's MQTT listener). Local MQTT tools share the bridge's single upstream connection.
+> **Printer sees:** 1 MQTT connection no matter how many local MQTT clients there are, plus one camera or FTPS connection per local client actually using them (those are end-to-end TLS, so they can't be shared).
 
 ---
 
@@ -114,7 +113,7 @@ Bambu Lab printers accept **3 simultaneous connections**. Once that limit is hit
 | | ESP32-S3 |
 |---|---|
 | MCU | Xtensa LX7 dual-core (240 MHz) |
-| RAM | 512 KB SRAM + 2 MB PSRAM |
+| RAM | 512 KB SRAM + 8 MB PSRAM (TLS sessions live in PSRAM) |
 | Flash | 8 MB (QIO 80 MHz) |
 | WiFi | 802.11 b/g/n, AP + Station simultaneous |
 | Status LED | GPIO21 (active low) |
@@ -136,8 +135,7 @@ Bambu Lab printers accept **3 simultaneous connections**. Once that limit is hit
 
 | Library | Version | Purpose |
 |---|---|---|
-| `PubSubClient` | ^2.8 | Upstream MQTT connection to printer |
-| `ArduinoJson` | ^7.4 | JSON parsing |
+| `PubSubClient` | 2.8 (vendored in `Lib/`) | Upstream MQTT connection to printer |
 
 **ESP32-S3 built-in:** `WiFi`, `WebServer`, `ESPmDNS`, `HTTPClient`, `WiFiClientSecure`, `Update`, `ArduinoOTA`
 
@@ -165,37 +163,35 @@ pio device monitor -b 115200
 | Flash Mode | `qio` |
 | Framework | Arduino |
 | Monitor Speed | 115200 |
-| USB CDC | `true` (native USB) |
+| USB CDC | `false` (USB-to-UART adapter) |
+| Platform | `espressif32@7.1.2` (pinned: TLS code uses mbedTLS internals) |
 
 ---
 
 ## Configuration
 
-Configuration is stored in EEPROM (512 bytes, magic `0x44`) and managed through the **web UI** (http://192.168.4.1).  
-Compile-time defaults live in `src/config.h` — they take effect after a magic-number change or EEPROM reset.
-Changing the EEPROM layout (magic number) clears saved settings; re-enter them via the web UI after flashing.
+Configuration is stored in EEPROM (512 bytes, magic `0x46`) and managed through the web UI. Settings saved by 1.0.0 (magic `0x45`) are migrated on boot.
+Compile-time defaults live in `src/config.h`; they apply to a blank device.
 
 ### Web UI Pages
 
 | Page | Path | Description |
-|---|---|---|---|
-| Dashboard | `/` | Connection status (Gateway Status + Gateway Identity cards), printer info, access code |
-| Printer | `/config/settings` | Printer host (IP validation on save), access code, serial number, model dropdown (P1S, P1P, P2S, X1C, X1E, A1, A1 Mini, A2L) |
-| WiFi | `/config/wifi` | Station SSID/password (leave blank for AP-only) |
-| Update | `/config/ota` | One-click firmware update from GitHub releases |
+|---|---|---|
+| Home | `/` | Status (WiFi, printer link + last error), gateway identity (IP, name, serial, model), settings form (WiFi, printer host, access code, serial, model), firmware update. Other paths redirect here |
 
 ### Compile-time Defaults (`src/config.h`)
 
 | Setting | Default | Description |
 |---|---|---|
-| `PRINTER_HOST_DFLT` | `bambu-printer.local` | Printer hostname or IP |
+| `PRINTER_HOST_DFLT` | `""` | Printer hostname or IP |
 | `PRINTER_CODE_DFLT` | `12345678` | Printer access code |
 | `PRINTER_SERIAL_DFLT` | `22E8BJ5B0000000` | Real printer serial (upstream MQTT) |
 | `PRINTER_MODEL_DFLT` | `P1S` | Printer model (used for Bambu Studio handshake); options: P1S, P1P, P2S, X1C, X1E, A1, A1 Mini, A2L |
 | `GATEWAY_AP_SSID` | `BambuTagger-Gateway` | Gateway WiFi name |
-| `GATEWAY_AP_PASS` | `""` (open) | Gateway WiFi password |
-| `MAX_MQTT_CLIENTS` | `8` | Max simultaneous local MQTT clients |
-| `MQTT_BUFFER_SIZE` | `2048` | MQTT packet buffer (bytes) |
+| `GATEWAY_AP_PASS` | `""` (open) | Setup AP password when no admin password is set |
+| `MAX_MQTT_CLIENTS` | `8` | Local MQTT client slots (the socket budget usually binds first, see Limitations) |
+| `MQTT_BUFFER_SIZE` | `20480` | MQTT packet buffer (bytes) |
+| `SOCKET_RESERVE` | `2` | Sockets kept free for the printer link and the web page |
 
 ---
 
@@ -203,33 +199,22 @@ Changing the EEPROM layout (magic number) clears saved settings; re-enter them v
 
 ### MQTT
 
-The gateway provides two ways to connect:
-
-| Parameter | Port 1883 (plain TCP) | Port 8883 (TLS passthrough) |
+| Parameter | Port 1883 | Port 8883 |
 |---|---|---|
-| Broker / Host | Gateway IP (`192.168.4.1` or STA IP) | Same |
-| Port | `1883` — plain TCP | `8883` — transparent TCP relay to the printer |
-| TLS | **Not encrypted** — local-only, trusted network | **End-to-end** with the real printer's certificate |
-| Username | (none) | `bblp` (embedded in Bambu Studio) |
-| Password | (none) | Printer access code |
-| How it works | MqttBridge multiplexes one upstream connection across up to 8 local clients. Topic subscription forwarding, fake printer mode. | Raw TCP proxy — each Studio connection gets its own relay to the printer's port 8883. Studio validates the printer's BBL-signed certificate directly. |
-| Best for | Local monitoring tools, MQTT clients | Bambu Studio / OrcaSlicer |
+| Host | Gateway IP | Same |
+| TLS | None, trusted networks only | Yes, gateway's own certificate (`/ca.pem`) |
+| Username / password | `bblp` / printer access code | Same |
+| Topics | `device/<serial>/report` and `/request`, with either the gateway serial or the printer serial | Same |
+| Best for | Local tools, Home Assistant | Bambu Studio / OrcaSlicer, Panda Status |
 
-### Camera
+Both ports share one upstream connection. Wrong or missing credentials get CONNACK 5 and the connection is closed; nothing reaches the printer before a valid login.
 
-| Parameter | Gateway Value |
-|---|---|
-| Host | `192.168.4.1` |
-| Port | `6000` |
-| Protocol | Raw TCP stream (forwarded from printer) |
+### Camera and FTPS
 
-### FTPS
-
-| Parameter | Gateway Value |
-|---|---|
-| Host | `192.168.4.1` |
-| Port | `990` |
-| Protocol | Raw TCP forwarder (TLS passthrough not implemented — see limitations) |
+| Service | Port | Notes |
+|---|---|---|
+| Camera | `6000` | End-to-end TLS with the printer; one printer connection per viewer |
+| FTPS | `990` | Control channel relayed; the passive data connection goes straight to the printer's IP, so the client must be able to reach the printer |
 
 ---
 
@@ -238,32 +223,35 @@ The gateway provides two ways to connect:
 ```
 BambuTagger-Gateway/
 ├── platformio.ini              # Build configuration
-└── src/
-    ├── config.h                # Printer credentials, WiFi, port limits
-    ├── main.cpp                # Entry point, WiFi setup, LED, bridge init
-    ├── mqtt_bridge.h/.cpp      # MQTT multiplexer (upstream + downstream + fake printer)
-    ├── tcp_proxy.h/.cpp        # Generic TCP forwarder (camera, FTPS)
-    └── ui/
-        ├── webconfig.h         # Web UI (dashboard, settings, update) + EEPROM helpers
-        └── logo_png.h          # 28×28 PNG favicon / nav logo
+├── src/
+│   ├── config.h                # Settings layout, defaults, ports, limits
+│   ├── main.cpp                # WiFi policy, LED, SSDP/mDNS/OTA, watchdog, PSRAM for TLS
+│   ├── mqtt_bridge.h/.cpp      # MQTT multiplexer (upstream, local clients, login, fake printer)
+│   ├── tls_client.h/.cpp       # TLS server side for port 8883
+│   ├── certgen.h/.cpp          # Generates the gateway's TLS certificate chain
+│   ├── tcp_proxy.h/.cpp        # Per-client camera/FTPS relay, socket helpers
+│   └── ui/
+│       ├── webconfig.h         # Web server, auth, EEPROM load/save/migration
+│       ├── page_dashboard.h    # The single web page
+│       ├── page_saved.h        # Save handler
+│       ├── page_ota.h          # GitHub update check and install
+│       └── github_ca.h         # Pinned root CAs for GitHub
+└── tools/check-*.py            # Offline checks (WiFi policy, config migration, CONNECT parser, proxy, publish)
 ```
 
 ---
 
-## Protocol Details: MQTT Bridge & Passthrough
+## Protocol Details: MQTT Bridge
 
-The gateway handles MQTT in two ways:
+A small MQTT broker in front of the printer. It:
 
-### 1. MqttBridge (port 1883)
-
-A software MQTT broker for local tools. It:
-
-1. **Connects upstream** to the printer's MQTT broker (port 8883) over **TLS** (`WiFiClientSecure` with `setInsecure()`) as a single client using `PubSubClient`
-2. **Listens locally** on port 1883 (plain TCP) for MQTT connections
+1. **Connects upstream** to the printer's MQTT broker (port 8883) over **TLS** as a single client using `PubSubClient` (retry every 10 s, backing off to 60 s while the printer is off)
+2. **Listens locally** on port 1883 (plain) and 8883 (TLS) and requires the printer's access code
 3. **Parses incoming MQTT packets** (CONNECT, SUBSCRIBE, UNSUBSCRIBE, PUBLISH, PINGREQ, DISCONNECT) and responds appropriately
 4. **Tracks subscriptions** per local client, including wildcard topics (`#`, `+`)
 5. **Routes upstream messages** — when the printer publishes a report, the bridge matches all local client subscriptions and forwards the message
-6. **Manages upstream subscriptions** — subscribes/unsubscribes on the printer connection based on aggregated local demand; only unsubscribes when no local client still wants a topic
+6. **Manages upstream subscriptions** — subscribes/unsubscribes on the printer connection based on aggregated local demand, and restores them after the printer reconnects
+7. **Drops dead clients** after 1.5x their keepalive
 
 #### Upstream MQTT
 
@@ -274,30 +262,25 @@ A software MQTT broker for local tools. It:
 | Password | Printer access code |
 | Subscribe | `device/<SERIAL>/report` |
 | Publish | `device/<SERIAL>/request` |
-| Will topic | `device/<SERIAL>/status` |
-| Will payload | `offline` (retained) |
-
-### 2. TLS Passthrough (port 8883)
-
-A transparent TCP relay for Bambu Studio / OrcaSlicer:
-
-1. **Listens** on port 8883 for TCP connections
-2. **Connects upstream** to the real printer's port 8883
-3. **Forwards raw bytes** bidirectionally — TLS is negotiated end-to-end between the slicer and the printer
-4. The printer's BBL-signed certificate is presented to the slicer, so no trust configuration is needed
-5. Each slicer instance gets its own dedicated upstream connection (up to 4 simultaneous)
+| Last will | none (the printer owns its availability) |
 
 ---
 
 ## Certificates
 
-The gateway does **not** terminate TLS. Port 8883 is a transparent TCP relay:
-TLS is negotiated end-to-end between Bambu Studio and the real printer. The
-printer presents its BBL-signed certificate, which the slicer's bundled
-`printer.cer` trust store already accepts.
+Port 8883 is terminated by the gateway. On first boot it generates a CA and a device certificate (CN = gateway serial, valid 2026-2049, stored in NVS) and serves the CA at `http://<gateway-ip>/ca.pem`. Clients that don't verify certificates (most MQTT tools, Panda Status) need nothing. For Bambu Studio, run `tools/trust-gateway.sh <gateway-ip>` if it refuses the connection. Firmware 1.0.0's certificate expired on 2027-01-01, so it is regenerated once on upgrade; re-run the script if you had trusted the old one.
 
-**No certificate configuration is needed.** Just point Bambu Studio at the
-gateway's IP on port 8883 as you would a real printer.
+---
+
+## Diagnostics
+
+The web page shows:
+
+- **Printer link** with the last connection error (e.g. "printer unreachable", "access code rejected")
+- **Local clients**: MQTT, camera, FTPS, and free sockets out of 16
+- **Last reset**: power-on, restart, crash, watchdog... After a crash it adds the task, PC and backtrace; decode with `xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/esp32-s3/firmware.elf <addresses>` using the same build
+
+Offline checks need only a C++ compiler: `for t in tools/check-*.py; do python3 $t; done` (`check-webui.py` takes the gateway URL instead).
 
 ---
 
@@ -305,23 +288,21 @@ gateway's IP on port 8883 as you would a real printer.
 
 | Symptom | Fix |
 |---|---|
-| Gateway AP not visible | Check `GATEWAY_AP_SSID` is set; verify ESP powers on (serial monitor); ESP32-S3 may need a full WiFi reset (`WiFi.mode(WIFI_OFF)` then back to `WIFI_AP`) on some boards |
-| MQTT clients can't connect | Ensure clients connect to `192.168.4.1:1883` (plain MQTT for local tools) or `192.168.4.1:8883` (TCP passthrough for Bambu Studio); connect to the gateway, not the printer directly |
-| Upstream MQTT fails | Verify `PRINTER_HOST`, `PRINTER_ACCESS_CODE`, `PRINTER_SERIAL`; printer must be on same network |
-| Camera stream not working | Some printers use different camera ports; check your printer model's port and update `CAM_PRINTER_PORT` |
-| FTPS not working | FTPS requires TLS which the TCP proxy does not terminate — use raw FTP or MQTT for file ops |
-| `DNS Failed for ...` in serial | ESP32-S3 doesn't resolve `.local` mDNS names via normal DNS — the gateway handles this via `MDNS.queryHost()` once station WiFi connects |
-| LED stays on / no blink | Gateway is booting; if stuck, check serial output for errors |
-| Bambu Studio can't connect | Connect via LAN to the gateway's IP on port 8883. The gateway relays TLS directly to the real printer — no certificate import needed. Set the printer model/serial from the Printer web page before connecting. Check that the gateway has a working upstream connection to the printer (LED off = all good). |
+| Setup AP not visible | Normal once home WiFi is saved: it appears only after WiFi has been down for 2 min (boot) or 10 min (connection loss), for 5 min. With no WiFi saved it is always on |
+| MQTT client rejected | It must log in with user `bblp` and the printer's access code. The page counts rejected logins and shows the last IP |
+| Printer link "connecting" | Read the error under it. "printer unreachable": printer off or wrong IP. "access code rejected": update the access code in Settings |
+| Camera/FTPS refused | Check "sockets free" on the page; the gateway keeps 2 free for the printer link and the page, see Limitations |
+| Forgot admin password | Reflash over USB with a full erase |
+| `DNS Failed for ...` in serial | `.local` names are resolved via `MDNS.queryHost()` once station WiFi is up (~3 s per attempt); prefer an IP |
 
 ---
 
 ## Limitations
 
-- **FTPS**: The TCP proxy forwards raw TCP bytes only. FTPS (FTP over TLS) requires TLS termination which is not implemented on the proxy. However, port 990 is a raw byte forwarder — if your FTPS client connects with TLS, it negotiates end-to-end with the real printer (same model as the MQTT passthrough).
-- **Camera**: The proxy assumes a plain TCP stream (e.g., MJPEG). If your printer uses a different protocol, adjust accordingly.
-- **Security**: Local MQTT on port 1883 is plain TCP (no TLS) — use on trusted networks only. Bambu Studio connects via TLS passthrough on port 8883 with end-to-end encryption to the real printer.
-- **mDNS resolution**: ESP32-S3's `WiFi.hostByName()` does not resolve `.local` mDNS names. The gateway uses `MDNS.queryHost()` after station WiFi connects — resolution takes ~3 seconds per attempt.
+- **16 sockets total.** This core's lwIP is compiled with 16 sockets for everything; 8 are taken by the listeners, SSDP, OTA and the printer link. With 2 kept in reserve, about 6 are left for clients: an MQTT client uses 1, a camera viewer or FTPS session uses 2 (local + printer). Raising the limit means rebuilding the Arduino libraries (e.g. pioarduino with a custom sdkconfig).
+- **FTPS** data connections go directly to the printer's IP (the PASV reply is inside TLS and can't be rewritten).
+- **Port 1883** is unencrypted; the access code crosses the network in clear. Use 8883 where possible.
+- **ArduinoOTA** has no password until an admin password is set.
 
 ---
 

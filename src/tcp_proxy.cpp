@@ -1,18 +1,29 @@
 #include "tcp_proxy.h"
 #ifdef ESP32
 #include <ESPmDNS.h>
+#include <lwip/sockets.h>
+
+bool peerOpen(WiFiClient &c) {
+  if (!c.connected()) return false;
+  if (c.available() > 0) return true;
+  uint8_t b;
+  int r = recv(c.fd(), &b, 1, MSG_PEEK | MSG_DONTWAIT);
+  return r > 0 || (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN));
+}
+
+int freeSockets() {
+  int n = 0;
+  for (int i = 0; i < CONFIG_LWIP_MAX_SOCKETS; i++)
+    n += lwip_fcntl(LWIP_SOCKET_OFFSET + i, F_GETFL, 0) < 0;
+  return n;
+}
 #endif
 
 TcpProxy::TcpProxy(const char *name, uint16_t localPort, const char *remoteHost,
                    uint16_t remotePort, uint8_t maxClients)
-  : _name(name), _localPort(localPort), _remotePort(remotePort),
-    _remoteHost(remoteHost), _maxClients(maxClients),
-    _server(localPort), _lastReconnect(0), _disconnected(true) {
+  : _name(name), _remotePort(remotePort), _remoteHost(remoteHost),
+    _maxClients(maxClients), _server(localPort) {
   _clients = new ProxyClient[maxClients];
-  for (uint8_t i = 0; i < maxClients; i++) {
-    _clients[i].active = false;
-    _clients[i].local = nullptr;
-  }
 }
 
 void TcpProxy::begin() {
@@ -21,73 +32,53 @@ void TcpProxy::begin() {
 }
 
 void TcpProxy::loop() {
-  if (!WiFi.isConnected() || strlen(_remoteHost) == 0) {
-    disconnectAll();
-    _upstream.stop();
-    _disconnected = true;
-    return;
-  }
+  bool ready = WiFi.isConnected() && strlen(_remoteHost) > 0;
 
-  if (!_upstream.connected() && !_disconnected) {
-    disconnectAll();
-    _disconnected = true;
-  }
-  while (acceptClient() >= 0) {}
-
-  bool hasClients = false;
-  for (uint8_t i = 0; i < _maxClients; i++) {
-    if (_clients[i].active && !_clients[i].local->connected()) disconnectClient(i);
-    if (_clients[i].active) hasClients = true;
-  }
-  // Idle camera/FTPS proxies must not occupy printer connection slots.
-  if (!hasClients) {
-    _upstream.stop();
-    _disconnected = true;
-    return;
-  }
-
-  if (!_upstream.connected()) {
-    unsigned long now = millis();
-    if (now - _lastReconnect > UPSTREAM_RETRY_MS) {
-      if (connectUpstream()) {
-        _disconnected = false;
-      }
-      _lastReconnect = millis();  // wait after the attempt, including its timeout
+  // Idle proxies hold no printer slot: upstream opens only for a local client,
+  // and a client the printer refuses is closed at once.
+  WiFiClient c = _server.accept();
+  if (c) {
+    ProxyClient *slot = nullptr;
+    for (uint8_t i = 0; i < _maxClients && !slot; i++)
+      if (!_clients[i].local.connected() && !_clients[i].up.connected()) slot = &_clients[i];
+    // The upstream needs one more socket on top of the reserve.
+    if (slot && ready && freeSockets() > SOCKET_RESERVE && connectUpstream(slot->up)) {
+      c.setNoDelay(true);
+      slot->local = c;
+    } else {
+      c.stop();
     }
-    return;
   }
 
-  // forward upstream -> all downstream (broadcast)
-  forwardUpToDown();
-
-  // forward downstream -> upstream (round-robin one client at a time)
   for (uint8_t i = 0; i < _maxClients; i++) {
-    if (!_clients[i].active) continue;
-    if (!_clients[i].local->connected()) {
-      disconnectClient(i);
-      continue;
+    ProxyClient &p = _clients[i];
+    if (!p.local.connected() && !p.up.connected()) continue;
+    pump(p.up, p.local);
+    pump(p.local, p.up);
+    if (!ready || !peerOpen(p.local) || !peerOpen(p.up)) {
+      p.local.stop();
+      p.up.stop();
     }
-    forwardDownToUp(i);
   }
+}
+
+int TcpProxy::clientCount() {
+  int n = 0;
+  for (uint8_t i = 0; i < _maxClients; i++) n += _clients[i].local.connected();
+  return n;
 }
 
 void TcpProxy::setRemote(const char *host, uint16_t port) {
   _remoteHost = host;
   _remotePort = port;
-  // force reconnect on next loop
-  if (_upstream.connected()) {
-    _upstream.stop();
-  }
-  _lastReconnect = 0;
 }
 
-bool TcpProxy::connectUpstream() {
-  if (_upstream.connected()) return true;
-  _upstream.stop();
+bool TcpProxy::connectUpstream(WiFiClient &up) {
+  up.stop();
 #ifdef ESP32
-  _upstream.setTimeout(1);  // ESP32 WiFiClient uses seconds, including TCP connect
+  up.setTimeout(1);  // ESP32 WiFiClient uses seconds, including TCP connect
 #else
-  _upstream.setTimeout(1000);
+  up.setTimeout(1000);
 #endif
 
   const char *host = _remoteHost;
@@ -107,63 +98,17 @@ bool TcpProxy::connectUpstream() {
     }
   }
 #endif
-  if (!_upstream.connect(host, _remotePort)) return false;
-  _upstream.setNoDelay(true);
+  if (!up.connect(host, _remotePort)) {
+    Serial.printf("%s: printer refused or unreachable\n", _name);
+    return false;
+  }
+  up.setNoDelay(true);
   return true;
 }
 
-int TcpProxy::acceptClient() {
-  WiFiClient *c = new WiFiClient(_server.accept());
-  if (!c || !c->connected()) {
-    delete c;
-    return -1;
-  }
-  c->setNoDelay(true);
-
-  for (uint8_t i = 0; i < _maxClients; i++) {
-    if (!_clients[i].active) {
-      _clients[i].local = c;
-      _clients[i].active = true;
-      return i;
-    }
-  }
-  c->stop();
-  delete c;
-  return -2;
-}
-
-void TcpProxy::disconnectClient(int idx) {
-  if (!_clients[idx].active) return;
-  _clients[idx].local->stop();
-  delete _clients[idx].local;
-  _clients[idx].local = nullptr;
-  _clients[idx].active = false;
-}
-
-void TcpProxy::disconnectAll() {
-  for (uint8_t i = 0; i < _maxClients; i++) {
-    if (_clients[i].active) {
-      disconnectClient(i);
-    }
-  }
-}
-
-void TcpProxy::forwardUpToDown() {
-  if (!_upstream.available()) return;
+void TcpProxy::pump(WiFiClient &from, WiFiClient &to) {
+  if (!from.available()) return;
   uint8_t buf[512];
-  int len = _upstream.read(buf, sizeof(buf));
-  if (len <= 0) return;
-  for (uint8_t i = 0; i < _maxClients; i++) {
-    if (_clients[i].active) {
-      _clients[i].local->write(buf, len);
-    }
-  }
-}
-
-void TcpProxy::forwardDownToUp(int idx) {
-  if (!_clients[idx].local->available()) return;
-  uint8_t buf[512];
-  int len = _clients[idx].local->read(buf, sizeof(buf));
-  if (len <= 0) return;
-  _upstream.write(buf, len);
+  int len = from.read(buf, sizeof(buf));
+  if (len > 0) to.write(buf, len);
 }

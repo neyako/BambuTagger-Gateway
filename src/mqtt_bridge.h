@@ -14,6 +14,9 @@
 #include "tls_client.h"
 #endif
 
+bool parseConnect(const uint8_t *b, size_t n, uint16_t &keepAlive,
+                  String &clientId, String &pass);
+
 struct MqttSub {
   String topic;
   uint8_t qos;
@@ -28,6 +31,9 @@ struct MqttClientCtx {
   bool active;
   bool isTls;        // client is TlsWiFiClient with pending/ongoing TLS
   unsigned long lastActivity;
+  uint16_t keepAlive;  // seconds; 0 = never time out
+  bool authed;         // sent a CONNECT with the printer's access code
+  IPAddress ip;
 };
 
 enum MqttStatus { MQTT_IDLE, MQTT_TRYING, MQTT_UP };
@@ -40,6 +46,10 @@ public:
   void loop();
   bool isConnected();
   MqttStatus getStatus();
+  const char *upstreamError() const { return _upErr; }  // last failed connect, "" once up
+  int clientCount();  // logged-in local clients
+  uint32_t authRejects() const { return _authRejects; }
+  IPAddress lastRejectIp() const { return _lastRejectIp; }
 
   // TLS certificate PEM (for web UI download)
   const char *getTlsCert();
@@ -61,6 +71,10 @@ private:
   MqttClientCtx _clients[MAX_MQTT_CLIENTS];
   unsigned long _lastReconnect;
   GatewayConfig *_cfg;
+  char _upErr[96] = "";
+  unsigned long _retryMs = UPSTREAM_RETRY_MS;
+  uint32_t _authRejects = 0;
+  IPAddress _lastRejectIp;
 
 #ifdef ESP32
   uint8_t _certDer[3072];  // concatenated server + CA DER chain
@@ -75,6 +89,7 @@ private:
 
   // upstream
   bool connectUpstream();
+  String upstreamTopic(const String &topic);
   void onUpstreamMessage(char *topic, uint8_t *payload, unsigned int len);
 
   // downstream
